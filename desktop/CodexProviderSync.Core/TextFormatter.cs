@@ -34,6 +34,16 @@ public static class TextFormatter
             lines.Insert(11, $"  Locked rollout files skipped during status scan: {status.LockedRolloutFiles.Count}");
         }
 
+        if (status.StateDbLocation is not null)
+        {
+            string legacyNote = status.StateDbLocation.Source == "legacy-root" ? " (legacy root)" : string.Empty;
+            lines.Add($"  database: {status.StateDbLocation.Path}{legacyNote}");
+        }
+        else
+        {
+            lines.Add("  database: not found (checked sqlite/state_5.sqlite, state_5.sqlite)");
+        }
+
         if (status.SqliteCounts?.Unreadable == true)
         {
             lines.Add($"  {status.SqliteCounts.Error ?? "state_5.sqlite is malformed or unreadable"}");

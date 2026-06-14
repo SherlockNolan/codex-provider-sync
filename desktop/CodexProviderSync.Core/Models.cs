@@ -23,11 +23,14 @@ public sealed class StatusSnapshot
     public required ProviderCounts EncryptedContentCounts { get; init; }
     public string? EncryptedContentWarning { get; init; }
     public required ProviderCounts? SqliteCounts { get; init; }
+    public StateDbLocation? StateDbLocation { get; init; }
     public SqliteRepairStats? SqliteRepairStats { get; init; }
     public IReadOnlyList<ProjectThreadVisibility> ProjectThreadVisibility { get; init; } = [];
     public required string BackupRoot { get; init; }
     public required BackupSummary BackupSummary { get; init; }
 }
+
+public sealed record StateDbLocation(string Path, string RelativePath, string Source);
 
 public sealed class SqliteRepairStats
 {

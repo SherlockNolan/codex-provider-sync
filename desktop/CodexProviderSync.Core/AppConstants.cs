@@ -8,6 +8,7 @@ public static class AppConstants
     public const string DefaultProvider = "openai";
     public const string BackupNamespace = "provider-sync";
     public const string DbFileBasename = "state_5.sqlite";
+    public const string SqliteDirBasename = "sqlite";
     public const string GlobalStateFileBasename = ".codex-global-state.json";
     public const string GlobalStateBackupFileBasename = ".codex-global-state.json.bak";
     public const int DefaultBackupRetentionCount = 5;

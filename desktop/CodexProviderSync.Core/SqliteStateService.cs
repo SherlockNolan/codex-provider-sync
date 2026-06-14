@@ -13,13 +13,51 @@ public sealed class SqliteStateService
 
     public string StateDbPath(string codexHome)
     {
+        return Path.Combine(codexHome, AppConstants.SqliteDirBasename, AppConstants.DbFileBasename);
+    }
+
+    public string LegacyStateDbPath(string codexHome)
+    {
         return Path.Combine(codexHome, AppConstants.DbFileBasename);
+    }
+
+    public IReadOnlyList<StateDbLocation> StateDbCandidates(string codexHome)
+    {
+        return
+        [
+            new StateDbLocation(
+                StateDbPath(codexHome),
+                Path.Combine(AppConstants.SqliteDirBasename, AppConstants.DbFileBasename),
+                "sqlite-dir"),
+            new StateDbLocation(
+                LegacyStateDbPath(codexHome),
+                AppConstants.DbFileBasename,
+                "legacy-root")
+        ];
+    }
+
+    public StateDbLocation? DetectStateDb(string codexHome)
+    {
+        foreach (StateDbLocation candidate in StateDbCandidates(codexHome))
+        {
+            if (File.Exists(candidate.Path))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    public string? ExistingStateDbPath(string codexHome)
+    {
+        return DetectStateDb(codexHome)?.Path;
     }
 
     public async Task<ProviderCounts?> ReadSqliteProviderCountsAsync(string codexHome)
     {
-        string dbPath = StateDbPath(codexHome);
-        if (!File.Exists(dbPath))
+        string? dbPath = ExistingStateDbPath(codexHome);
+        if (dbPath is null)
         {
             return null;
         }
@@ -83,8 +121,8 @@ public sealed class SqliteStateService
         IReadOnlyCollection<string>? userEventThreadIds = null,
         IReadOnlyDictionary<string, string>? threadCwdsById = null)
     {
-        string dbPath = StateDbPath(codexHome);
-        if (!File.Exists(dbPath))
+        string? dbPath = ExistingStateDbPath(codexHome);
+        if (dbPath is null)
         {
             return null;
         }
@@ -151,8 +189,8 @@ public sealed class SqliteStateService
 
     public async Task<bool> AssertSqliteWritableAsync(string codexHome, int? busyTimeoutMs = null)
     {
-        string dbPath = StateDbPath(codexHome);
-        if (!File.Exists(dbPath))
+        string? dbPath = ExistingStateDbPath(codexHome);
+        if (dbPath is null)
         {
             return false;
         }
@@ -182,8 +220,8 @@ public sealed class SqliteStateService
         IReadOnlyCollection<string>? userEventThreadIds = null,
         IReadOnlyDictionary<string, string>? threadCwdsById = null)
     {
-        string dbPath = StateDbPath(codexHome);
-        if (!File.Exists(dbPath))
+        string? dbPath = ExistingStateDbPath(codexHome);
+        if (dbPath is null)
         {
             if (afterUpdate is not null)
             {

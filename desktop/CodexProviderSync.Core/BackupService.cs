@@ -26,12 +26,16 @@ public sealed class BackupService
         Directory.CreateDirectory(dbDir);
 
         List<string> copiedDbFiles = [];
-        foreach (string suffix in new[] { string.Empty, "-shm", "-wal" })
+        StateDbLocation? stateDb = _sqliteStateService.DetectStateDb(codexHome);
+        if (stateDb is not null)
         {
-            string fileName = $"{AppConstants.DbFileBasename}{suffix}";
-            if (await CopyIfPresentAsync(Path.Combine(codexHome, fileName), Path.Combine(dbDir, fileName), overwrite: false))
+            foreach (string suffix in new[] { string.Empty, "-shm", "-wal" })
             {
-                copiedDbFiles.Add(fileName);
+                string relativePath = DbBackupRelativePath(codexHome, stateDb.Path, suffix);
+                if (await CopyIfPresentAsync(stateDb.Path + suffix, Path.Combine(dbDir, relativePath), overwrite: false))
+                {
+                    copiedDbFiles.Add(relativePath);
+                }
             }
         }
 
@@ -139,19 +143,23 @@ public sealed class BackupService
             string dbDir = Path.Combine(normalizedBackupDir, "db");
             HashSet<string> backedUpFiles = new(metadata.DbFiles, StringComparer.Ordinal);
 
-            foreach (string suffix in new[] { string.Empty, "-shm", "-wal" })
+            foreach (string baseFile in metadata.DbFiles.Where(static fileName => Path.GetFileName(fileName) == AppConstants.DbFileBasename))
             {
-                string fileName = $"{AppConstants.DbFileBasename}{suffix}";
-                string targetPath = Path.Combine(codexHome, fileName);
-                if (!backedUpFiles.Contains(fileName) && File.Exists(targetPath))
+                string basePath = RestoreDbTargetPath(codexHome, baseFile);
+                foreach (string suffix in new[] { "-shm", "-wal" })
                 {
-                    File.Delete(targetPath);
+                    string sidecarFile = baseFile + suffix;
+                    string sidecarPath = basePath + suffix;
+                    if (!backedUpFiles.Contains(sidecarFile) && File.Exists(sidecarPath))
+                    {
+                        File.Delete(sidecarPath);
+                    }
                 }
             }
 
             foreach (string fileName in metadata.DbFiles)
             {
-                await CopyIfPresentAsync(Path.Combine(dbDir, fileName), Path.Combine(codexHome, fileName), overwrite: true);
+                await CopyIfPresentAsync(Path.Combine(dbDir, fileName), RestoreDbTargetPath(codexHome, fileName), overwrite: true);
             }
         }
 
@@ -303,6 +311,26 @@ public sealed class BackupService
         File.Copy(sourcePath, destinationPath, overwrite);
         await Task.CompletedTask;
         return true;
+    }
+
+    private static string DbBackupRelativePath(string codexHome, string dbPath, string suffix)
+    {
+        string relativePath = Path.GetRelativePath(codexHome, dbPath + suffix);
+        return !relativePath.StartsWith("..", StringComparison.Ordinal)
+            && !Path.IsPathRooted(relativePath)
+            ? relativePath
+            : AppConstants.DbFileBasename + suffix;
+    }
+
+    private static string RestoreDbTargetPath(string codexHome, string relativePath)
+    {
+        if (Path.IsPathRooted(relativePath)
+            || relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains("..", StringComparer.Ordinal))
+        {
+            throw new InvalidOperationException($"Invalid database backup path: {relativePath}");
+        }
+
+        return Path.Combine(codexHome, relativePath);
     }
 
     private static JsonSerializerOptions JsonOptions()

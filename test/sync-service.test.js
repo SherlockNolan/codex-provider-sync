@@ -14,7 +14,7 @@ import {
   updateSessionBackupManifest
 } from "../src/backup.js";
 import { getStatus, renderStatus, runRestore, runSwitch, runSync } from "../src/service.js";
-import { DEFAULT_BACKUP_RETENTION_COUNT } from "../src/constants.js";
+import { DB_FILE_BASENAME, DEFAULT_BACKUP_RETENTION_COUNT, SQLITE_DIR_BASENAME } from "../src/constants.js";
 import { getUnsupportedNodeVersionMessage } from "../src/node-version.js";
 import { applySessionChanges, collectSessionChanges } from "../src/session-files.js";
 
@@ -94,8 +94,17 @@ async function writeGlobalState(codexHome, value) {
   await fs.writeFile(path.join(codexHome, ".codex-global-state.json.bak"), text, "utf8");
 }
 
+function stateDbPath(codexHome) {
+  return path.join(codexHome, SQLITE_DIR_BASENAME, DB_FILE_BASENAME);
+}
+
+function legacyStateDbPath(codexHome) {
+  return path.join(codexHome, DB_FILE_BASENAME);
+}
+
 async function writeStateDb(codexHome, rows) {
-  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const dbPath = stateDbPath(codexHome);
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
@@ -117,7 +126,8 @@ async function writeStateDb(codexHome, rows) {
 }
 
 async function writeStateDbWithUserEventColumn(codexHome, rows) {
-  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const dbPath = stateDbPath(codexHome);
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
@@ -140,7 +150,8 @@ async function writeStateDbWithUserEventColumn(codexHome, rows) {
 }
 
 async function writeStateDbForProjectVisibility(codexHome, rows) {
-  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const dbPath = stateDbPath(codexHome);
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
@@ -271,13 +282,18 @@ test("runSync rewrites rollout files and sqlite, then restore reverts both", asy
   assert.equal(syncResult.changedSessionFiles, 2);
   assert.deepEqual(syncResult.skippedLockedRolloutFiles, []);
   assert.equal(syncResult.sqliteRowsUpdated, 2);
+  const backupMetadata = JSON.parse(await fs.readFile(path.join(syncResult.backupDir, "metadata.json"), "utf8"));
+  assert.deepEqual(
+    backupMetadata.dbFiles.map((fileName) => fileName.replaceAll("\\", "/")),
+    ["sqlite/state_5.sqlite"]
+  );
 
   const syncedSession = await fs.readFile(sessionPath, "utf8");
   const syncedArchived = await fs.readFile(archivedPath, "utf8");
   assert.match(syncedSession, /"model_provider":"openai"/);
   assert.match(syncedArchived, /"model_provider":"openai"/);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const providers = db
       .prepare("SELECT id, model_provider FROM threads ORDER BY id")
@@ -352,7 +368,7 @@ test("runSync repairs SQLite has_user_event from rollout user messages", async (
   assert.equal(syncResult.sqliteRowsUpdated, 1);
   assert.equal(syncResult.sqliteUserEventRowsUpdated, 1);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const row = db
       .prepare("SELECT has_user_event FROM threads WHERE id = ?")
@@ -390,7 +406,7 @@ test("runSync repairs SQLite cwd from rollout session metadata", async () => {
   assert.equal(syncResult.sqliteRowsUpdated, 1);
   assert.equal(syncResult.sqliteCwdRowsUpdated, 1);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const row = db
       .prepare("SELECT cwd FROM threads WHERE id = ?")
@@ -427,7 +443,7 @@ test("runSync normalizes extended rollout cwd before repairing SQLite", async ()
   assert.equal(syncResult.sqliteRowsUpdated, 1);
   assert.equal(syncResult.sqliteCwdRowsUpdated, 1);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const row = db
       .prepare("SELECT cwd FROM threads WHERE id = ?")
@@ -536,8 +552,38 @@ test("status reports implicit default provider and rollout/sqlite counts", async
   assert.equal(status.currentProviderImplicit, true);
   assert.deepEqual(status.rolloutCounts.sessions, { apigather: 1 });
   assert.deepEqual(status.sqliteCounts.archived_sessions, { openai: 1 });
+  assert.equal(status.stateDbLocation.source, "sqlite-dir");
+  assert.equal(status.stateDbLocation.path, stateDbPath(codexHome));
   assert.equal(status.backupSummary.count, 2);
   assert.equal(status.backupSummary.totalBytes, backupOneBytes + backupTwoBytes);
+  assert.match(renderStatus(status), new RegExp(`database: ${stateDbPath(codexHome).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}`));
+});
+
+test("status falls back to legacy root sqlite database", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome);
+  const sqliteDir = path.dirname(stateDbPath(codexHome));
+  await fs.mkdir(sqliteDir, { recursive: true });
+  const db = new DatabaseSync(legacyStateDbPath(codexHome));
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        model_provider TEXT,
+        archived INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    db.prepare("INSERT INTO threads (id, model_provider, archived) VALUES (?, ?, ?)").run("legacy-thread", "openai", 0);
+  } finally {
+    db.close();
+  }
+
+  const status = await getStatus({ codexHome });
+
+  assert.equal(status.stateDbLocation.source, "legacy-root");
+  assert.equal(status.stateDbLocation.path, legacyStateDbPath(codexHome));
+  assert.deepEqual(status.sqliteCounts.sessions, { openai: 1 });
+  assert.match(renderStatus(status), /legacy root/);
 });
 
 test("status reports pending SQLite user-event and cwd repairs", async () => {
@@ -624,7 +670,7 @@ test("runSync leaves rollout files and sqlite untouched when sqlite is locked", 
     { id: "thread-a", model_provider: "apigather", archived: false }
   ]);
 
-  const lockDb = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const lockDb = new DatabaseSync(stateDbPath(codexHome));
   try {
     lockDb.exec("BEGIN IMMEDIATE");
     await assert.rejects(
@@ -643,7 +689,7 @@ test("runSync leaves rollout files and sqlite untouched when sqlite is locked", 
   const rollout = await fs.readFile(sessionPath, "utf8");
   assert.match(rollout, /"model_provider":"apigather"/);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const row = db
       .prepare("SELECT model_provider FROM threads WHERE id = ?")
@@ -683,7 +729,7 @@ test("runSync skips locked rollout files and still updates sqlite", async () => 
   const rollout = await fs.readFile(sessionPath, "utf8");
   assert.match(rollout, /"model_provider":"apigather"/);
 
-  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  const db = new DatabaseSync(stateDbPath(codexHome));
   try {
     const row = db
       .prepare("SELECT model_provider FROM threads WHERE id = ?")
@@ -916,7 +962,8 @@ test("runSync fails before rollout rewrite when SQLite is malformed", async () =
   await writeConfig(codexHome, 'model_provider = "openai"');
   const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-malformed-db.jsonl");
   await writeRollout(sessionPath, "thread-malformed", "apigather");
-  await fs.writeFile(path.join(codexHome, "state_5.sqlite"), "not sqlite", "utf8");
+  await fs.mkdir(path.dirname(stateDbPath(codexHome)), { recursive: true });
+  await fs.writeFile(stateDbPath(codexHome), "not sqlite", "utf8");
 
   await assert.rejects(
     () => runSync({ codexHome }),
@@ -929,7 +976,8 @@ test("status reports malformed SQLite without failing", async () => {
   const { codexHome } = await makeTempCodexHome();
   await writeConfig(codexHome, 'model_provider = "openai"');
   await writeRollout(path.join(codexHome, "sessions", "2026", "03", "19", "rollout-status-db.jsonl"), "thread-status", "openai");
-  await fs.writeFile(path.join(codexHome, "state_5.sqlite"), "not sqlite", "utf8");
+  await fs.mkdir(path.dirname(stateDbPath(codexHome)), { recursive: true });
+  await fs.writeFile(stateDbPath(codexHome), "not sqlite", "utf8");
 
   const status = await getStatus({ codexHome });
   assert.equal(status.sqliteCounts.unreadable, true);

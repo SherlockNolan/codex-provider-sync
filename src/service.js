@@ -33,6 +33,7 @@ import {
 } from "./session-files.js";
 import {
   assertSqliteWritable,
+  detectStateDb,
   readSqliteProviderCounts,
   readSqliteRepairStats,
   updateSqliteProvider
@@ -108,6 +109,7 @@ export async function getStatus({ codexHome: explicitCodexHome } = {}) {
     userEventThreadIds,
     threadCwdById
   } = await collectSessionChanges(codexHome, "__status_only__", { skipLockedReads: true });
+  const stateDbLocation = await detectStateDb(codexHome);
   const sqliteCounts = await readSqliteProviderCounts(codexHome);
   const sqliteRepairStats = sqliteCounts && !sqliteCounts.unreadable
     ? await readSqliteRepairStats(codexHome, { userEventThreadIds, threadCwdById })
@@ -127,6 +129,7 @@ export async function getStatus({ codexHome: explicitCodexHome } = {}) {
     encryptedContentCounts,
     encryptedContentWarning: buildEncryptedContentWarning(encryptedContentCounts, current.provider ?? DEFAULT_PROVIDER),
     sqliteCounts,
+    stateDbLocation,
     sqliteRepairStats,
     projectThreadVisibility,
     backupRoot: defaultBackupRoot(codexHome),
@@ -160,6 +163,12 @@ export function renderStatus(status) {
 
   lines.push("");
   lines.push("SQLite state:");
+  if (status.stateDbLocation) {
+    const legacyNote = status.stateDbLocation.source === "legacy-root" ? " (legacy root)" : "";
+    lines.push(`  database: ${status.stateDbLocation.path}${legacyNote}`);
+  } else {
+    lines.push("  database: not found (checked sqlite/state_5.sqlite, state_5.sqlite)");
+  }
   if (status.sqliteCounts?.unreadable) {
     lines.push(`  ${status.sqliteCounts.error ?? "state_5.sqlite is malformed or unreadable"}`);
   } else if (!status.sqliteCounts) {

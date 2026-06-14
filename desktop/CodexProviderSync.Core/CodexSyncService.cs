@@ -50,6 +50,7 @@ public sealed class CodexSyncService
         CurrentProviderInfo currentProvider = _configFileService.ReadCurrentProviderFromConfigText(configText);
         IReadOnlyList<string> configuredProviders = _configFileService.ListConfiguredProviderIds(configText);
         SessionChangeCollection rolloutInfo = await _sessionRolloutService.CollectSessionChangesAsync(codexHome, "__status_only__", skipLockedReads: true);
+        StateDbLocation? stateDbLocation = _sqliteStateService.DetectStateDb(codexHome);
         ProviderCounts? sqliteCounts = await _sqliteStateService.ReadSqliteProviderCountsAsync(codexHome);
         SqliteRepairStats? sqliteRepairStats = sqliteCounts is not null && !sqliteCounts.Unreadable
             ? await _sqliteStateService.ReadSqliteRepairStatsAsync(
@@ -72,6 +73,7 @@ public sealed class CodexSyncService
             EncryptedContentCounts = rolloutInfo.EncryptedContentCounts,
             EncryptedContentWarning = BuildEncryptedContentWarning(rolloutInfo.EncryptedContentCounts, currentProvider.Provider),
             SqliteCounts = sqliteCounts,
+            StateDbLocation = stateDbLocation,
             SqliteRepairStats = sqliteRepairStats,
             ProjectThreadVisibility = projectThreadVisibility,
             BackupRoot = _codexHomeService.BackupRoot(codexHome),
