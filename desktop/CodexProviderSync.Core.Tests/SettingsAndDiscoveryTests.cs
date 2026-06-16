@@ -45,6 +45,7 @@ public sealed class SettingsAndDiscoveryTests
                 ArchivedSessions = new Dictionary<string, int>(StringComparer.Ordinal)
             },
             LockedRolloutFiles = [],
+            UnreadableRolloutFiles = [],
             EncryptedContentCounts = new ProviderCounts(),
             SqliteCounts = new ProviderCounts
             {

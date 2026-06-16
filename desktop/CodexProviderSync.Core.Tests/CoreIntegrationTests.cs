@@ -26,6 +26,7 @@ public sealed class CoreIntegrationTests
         Assert.Equal("openai", syncResult.TargetProvider);
         Assert.Equal(2, syncResult.ChangedSessionFiles);
         Assert.Empty(syncResult.SkippedLockedRolloutFiles);
+        Assert.Empty(syncResult.SkippedUnreadableRolloutFiles);
         Assert.Equal(2, syncResult.SqliteRowsUpdated);
         BackupMetadataFile backupMetadata = JsonSerializer.Deserialize<BackupMetadataFile>(
             await File.ReadAllTextAsync(Path.Combine(syncResult.BackupDir, "metadata.json")),
@@ -446,6 +447,7 @@ public sealed class CoreIntegrationTests
         Assert.Equal(0, result.ChangedSessionFiles);
         Assert.Equal(1, result.SqliteRowsUpdated);
         Assert.Equal([sessionPath], result.SkippedLockedRolloutFiles);
+        Assert.Empty(result.SkippedUnreadableRolloutFiles);
 
         string rollout = await File.ReadAllTextAsync(sessionPath);
         Assert.Contains("\"model_provider\":\"apigather\"", rollout);
@@ -565,6 +567,7 @@ public sealed class CoreIntegrationTests
         Assert.Equal(0, result.ChangedSessionFiles);
         Assert.Equal(1, result.SqliteRowsUpdated);
         Assert.Equal([sessionPath], result.SkippedLockedRolloutFiles);
+        Assert.Empty(result.SkippedUnreadableRolloutFiles);
 
         string rollout = await File.ReadAllTextAsync(sessionPath);
         Assert.Contains("\"model_provider\":\"apigather\"", rollout);
@@ -588,7 +591,32 @@ public sealed class CoreIntegrationTests
         StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
 
         Assert.Equal([sessionPath], status.LockedRolloutFiles);
+        Assert.Empty(status.UnreadableRolloutFiles);
         Assert.Contains("Locked rollout files skipped during status scan: 1", TextFormatter.FormatStatus(status));
+    }
+
+    [Fact]
+    public void FormatStatus_ReportsUnreadableRolloutFiles()
+    {
+        StatusSnapshot status = new()
+        {
+            CodexHome = @"C:\Users\test\.codex",
+            CurrentProvider = new CurrentProviderInfo("openai", false),
+            ConfiguredProviders = ["openai"],
+            RolloutCounts = new ProviderCounts(),
+            LockedRolloutFiles = [],
+            UnreadableRolloutFiles = [@"C:\Users\test\.codex\sessions\rollout-bad.jsonl"],
+            EncryptedContentCounts = new ProviderCounts(),
+            SqliteCounts = null,
+            BackupRoot = @"C:\Users\test\.codex\backups_state\provider-sync",
+            BackupSummary = new BackupSummary
+            {
+                Count = 0,
+                TotalBytes = 0
+            }
+        };
+
+        Assert.Contains("Unreadable rollout files skipped during status scan: 1", TextFormatter.FormatStatus(status));
     }
 
     [Fact]

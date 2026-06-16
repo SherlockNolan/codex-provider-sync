@@ -70,6 +70,7 @@ public sealed class CodexSyncService
             ConfiguredProviders = configuredProviders,
             RolloutCounts = rolloutInfo.ProviderCounts,
             LockedRolloutFiles = rolloutInfo.LockedPaths,
+            UnreadableRolloutFiles = rolloutInfo.UnreadablePaths,
             EncryptedContentCounts = rolloutInfo.EncryptedContentCounts,
             EncryptedContentWarning = BuildEncryptedContentWarning(rolloutInfo.EncryptedContentCounts, currentProvider.Provider),
             SqliteCounts = sqliteCounts,
@@ -119,6 +120,10 @@ public sealed class CodexSyncService
             await _sessionRolloutService.SplitLockedSessionChangesAsync(sessionInfo.Changes);
 
         List<string> skippedRolloutFiles = [.. sessionInfo.LockedPaths, .. lockedChanges.Select(static change => change.Path)];
+        IReadOnlyList<string> skippedUnreadableRolloutFiles = sessionInfo.UnreadablePaths
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToList();
 
         await _sqliteStateService.AssertSqliteWritableAsync(codexHome, sqliteBusyTimeoutMs);
         string backupDir = await _backupService.CreateBackupAsync(codexHome, targetProvider, writableChanges, configPath, configBackupText);
@@ -178,6 +183,7 @@ public sealed class CodexSyncService
                 BackupDir = backupDir,
                 ChangedSessionFiles = applyResult?.AppliedCount ?? 0,
                 SkippedLockedRolloutFiles = skippedRolloutFiles,
+                SkippedUnreadableRolloutFiles = skippedUnreadableRolloutFiles,
                 SqliteRowsUpdated = updatedRows,
                 SqliteProviderRowsUpdated = providerRowsUpdated,
                 SqliteUserEventRowsUpdated = userEventRowsUpdated,
@@ -264,6 +270,7 @@ public sealed class CodexSyncService
                 BackupDir = result.BackupDir,
                 ChangedSessionFiles = result.ChangedSessionFiles,
                 SkippedLockedRolloutFiles = result.SkippedLockedRolloutFiles,
+                SkippedUnreadableRolloutFiles = result.SkippedUnreadableRolloutFiles,
                 SqliteRowsUpdated = result.SqliteRowsUpdated,
                 SqliteProviderRowsUpdated = result.SqliteProviderRowsUpdated,
                 SqliteUserEventRowsUpdated = result.SqliteUserEventRowsUpdated,

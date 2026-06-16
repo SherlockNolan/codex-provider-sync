@@ -28,15 +28,20 @@ internal static class MacDisplayFormatter
             "SQLite 状态:"
         ];
 
-        if (!string.IsNullOrWhiteSpace(status.EncryptedContentWarning))
-        {
-            lines.Insert(11, $"  {status.EncryptedContentWarning}");
-        }
-
+        List<string> rolloutNotes = [];
         if (status.LockedRolloutFiles.Count > 0)
         {
-            lines.Insert(11, $"  状态扫描时跳过 locked rollout 文件: {status.LockedRolloutFiles.Count}");
+            rolloutNotes.Add($"  状态扫描时跳过 locked rollout 文件: {status.LockedRolloutFiles.Count}");
         }
+        if (status.UnreadableRolloutFiles.Count > 0)
+        {
+            rolloutNotes.Add($"  状态扫描时跳过不可读 rollout 文件: {status.UnreadableRolloutFiles.Count}");
+        }
+        if (!string.IsNullOrWhiteSpace(status.EncryptedContentWarning))
+        {
+            rolloutNotes.Add($"  {status.EncryptedContentWarning}");
+        }
+        lines.InsertRange(11, rolloutNotes);
 
         if (status.StateDbLocation is not null)
         {
@@ -119,6 +124,13 @@ internal static class MacDisplayFormatter
             int extraCount = result.SkippedLockedRolloutFiles.Count - Math.Min(result.SkippedLockedRolloutFiles.Count, 5);
             lines.Add($"跳过 locked rollout 文件: {result.SkippedLockedRolloutFiles.Count}");
             lines.Add($"Locked 文件: {preview}{(extraCount > 0 ? $"（另有 {extraCount} 个）" : string.Empty)}");
+        }
+        if (result.SkippedUnreadableRolloutFiles.Count > 0)
+        {
+            string preview = string.Join(", ", result.SkippedUnreadableRolloutFiles.Take(5));
+            int extraCount = result.SkippedUnreadableRolloutFiles.Count - Math.Min(result.SkippedUnreadableRolloutFiles.Count, 5);
+            lines.Add($"跳过不可读 rollout 文件: {result.SkippedUnreadableRolloutFiles.Count}");
+            lines.Add($"不可读文件: {preview}{(extraCount > 0 ? $"（另有 {extraCount} 个）" : string.Empty)}");
         }
         if (!string.IsNullOrWhiteSpace(result.EncryptedContentWarning))
         {

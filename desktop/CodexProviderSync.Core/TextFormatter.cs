@@ -24,15 +24,20 @@ public static class TextFormatter
             "SQLite state:"
         ];
 
-        if (!string.IsNullOrWhiteSpace(status.EncryptedContentWarning))
-        {
-            lines.Insert(11, $"  {status.EncryptedContentWarning}");
-        }
-
+        List<string> rolloutNotes = [];
         if (status.LockedRolloutFiles.Count > 0)
         {
-            lines.Insert(11, $"  Locked rollout files skipped during status scan: {status.LockedRolloutFiles.Count}");
+            rolloutNotes.Add($"  Locked rollout files skipped during status scan: {status.LockedRolloutFiles.Count}");
         }
+        if (status.UnreadableRolloutFiles.Count > 0)
+        {
+            rolloutNotes.Add($"  Unreadable rollout files skipped during status scan: {status.UnreadableRolloutFiles.Count}");
+        }
+        if (!string.IsNullOrWhiteSpace(status.EncryptedContentWarning))
+        {
+            rolloutNotes.Add($"  {status.EncryptedContentWarning}");
+        }
+        lines.InsertRange(11, rolloutNotes);
 
         if (status.StateDbLocation is not null)
         {
@@ -111,6 +116,13 @@ public static class TextFormatter
             int extraCount = result.SkippedLockedRolloutFiles.Count - Math.Min(result.SkippedLockedRolloutFiles.Count, 5);
             lines.Add($"Skipped locked rollout files: {result.SkippedLockedRolloutFiles.Count}");
             lines.Add($"Locked file(s): {preview}{(extraCount > 0 ? $" (+{extraCount} more)" : string.Empty)}");
+        }
+        if (result.SkippedUnreadableRolloutFiles.Count > 0)
+        {
+            string preview = string.Join(", ", result.SkippedUnreadableRolloutFiles.Take(5));
+            int extraCount = result.SkippedUnreadableRolloutFiles.Count - Math.Min(result.SkippedUnreadableRolloutFiles.Count, 5);
+            lines.Add($"Skipped unreadable rollout files: {result.SkippedUnreadableRolloutFiles.Count}");
+            lines.Add($"Unreadable file(s): {preview}{(extraCount > 0 ? $" (+{extraCount} more)" : string.Empty)}");
         }
 
         if (!string.IsNullOrWhiteSpace(result.EncryptedContentWarning))

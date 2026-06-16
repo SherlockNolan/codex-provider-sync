@@ -20,6 +20,7 @@ public sealed class StatusSnapshot
     public required IReadOnlyList<string> ConfiguredProviders { get; init; }
     public required ProviderCounts RolloutCounts { get; init; }
     public required IReadOnlyList<string> LockedRolloutFiles { get; init; }
+    public required IReadOnlyList<string> UnreadableRolloutFiles { get; init; }
     public required ProviderCounts EncryptedContentCounts { get; init; }
     public string? EncryptedContentWarning { get; init; }
     public required ProviderCounts? SqliteCounts { get; init; }
@@ -82,6 +83,7 @@ public sealed class SessionChangeCollection
 {
     public required IReadOnlyList<SessionChange> Changes { get; init; }
     public required IReadOnlyList<string> LockedPaths { get; init; }
+    public required IReadOnlyList<string> UnreadablePaths { get; init; }
     public required ProviderCounts ProviderCounts { get; init; }
     public required ProviderCounts EncryptedContentCounts { get; init; }
     public required IReadOnlyCollection<string> UserEventThreadIds { get; init; }
@@ -96,6 +98,7 @@ public sealed class SyncResult
     public required string BackupDir { get; init; }
     public required int ChangedSessionFiles { get; init; }
     public required IReadOnlyList<string> SkippedLockedRolloutFiles { get; init; }
+    public required IReadOnlyList<string> SkippedUnreadableRolloutFiles { get; init; }
     public required int SqliteRowsUpdated { get; init; }
     public int SqliteProviderRowsUpdated { get; init; }
     public int SqliteUserEventRowsUpdated { get; init; }

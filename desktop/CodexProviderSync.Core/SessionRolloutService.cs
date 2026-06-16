@@ -16,6 +16,7 @@ public sealed class SessionRolloutService
     {
         List<SessionChange> changes = [];
         List<string> lockedPaths = [];
+        List<string> unreadablePaths = [];
         Dictionary<string, int> sessionCounts = new(StringComparer.Ordinal);
         Dictionary<string, int> archivedCounts = new(StringComparer.Ordinal);
         Dictionary<string, int> encryptedSessionCounts = new(StringComparer.Ordinal);
@@ -41,6 +42,11 @@ public sealed class SessionRolloutService
                 catch (Exception error) when (skipLockedReads && IsRolloutFileBusyError(error))
                 {
                     lockedPaths.Add(rolloutPath);
+                    continue;
+                }
+                catch (Exception error) when (skipLockedReads && IsRolloutFileUnreadableError(error))
+                {
+                    unreadablePaths.Add(rolloutPath);
                     continue;
                 }
 
@@ -72,6 +78,11 @@ public sealed class SessionRolloutService
                 catch (Exception error) when (skipLockedReads && IsRolloutFileBusyError(error))
                 {
                     lockedPaths.Add(rolloutPath);
+                    continue;
+                }
+                catch (Exception error) when (skipLockedReads && IsRolloutFileUnreadableError(error))
+                {
+                    unreadablePaths.Add(rolloutPath);
                     continue;
                 }
 
@@ -107,6 +118,7 @@ public sealed class SessionRolloutService
         {
             Changes = changes,
             LockedPaths = lockedPaths.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList(),
+            UnreadablePaths = unreadablePaths.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList(),
             ProviderCounts = new ProviderCounts
             {
                 Sessions = sessionCounts,
@@ -742,6 +754,16 @@ public sealed class SessionRolloutService
         }
 
         return false;
+    }
+
+    private static bool IsRolloutFileUnreadableError(Exception error)
+    {
+        if (error.InnerException is not null && IsRolloutFileUnreadableError(error.InnerException))
+        {
+            return true;
+        }
+
+        return error is IOException or UnauthorizedAccessException;
     }
 
     private static Exception WrapRolloutFileBusyError(Exception error, string filePath, string action)
