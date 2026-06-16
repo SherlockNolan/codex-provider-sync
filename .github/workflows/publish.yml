@@ -9,16 +9,62 @@ jobs:
   publish:
     runs-on: windows-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          cache: "npm"
+          cache: npm
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - run: npm ci
       - run: npm test
-      - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: dotnet test desktop/CodexProviderSync.Core.Tests/CodexProviderSync.Core.Tests.csproj
+
+      - name: Build Windows GUI
+        shell: pwsh
+        run: ./scripts/publish-gui.ps1 -Output artifacts/win-x64
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $assetRoot = "artifacts/release"
+          New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
+
+          $exe = "artifacts/win-x64/CodexProviderSync.exe"
+          $zip = Join-Path $assetRoot "codex-provider-sync-v$version-win-x64.zip"
+          Compress-Archive -Path "artifacts/win-x64/*" -DestinationPath $zip -Force
+          Copy-Item $exe (Join-Path $assetRoot "CodexProviderSync.exe") -Force
+
+          $assets = Get-ChildItem -File $assetRoot | Sort-Object Name
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)"
+            Set-Content -LiteralPath "$($asset.FullName).sha256" -Value "$hash  $($asset.Name)" -Encoding ASCII
+          }
+          Set-Content -LiteralPath (Join-Path $assetRoot "checksums.txt") -Value $checksums -Encoding ASCII
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/release/*
+          body: |
+            ## 安全边界
+            - 不会修改 auth.json
+            - 不会改写对话正文或消息历史
+            - 不会修改 updated_at 来改变排序
+            - 不会重新加密 encrypted_content
+
+            ## 回滚
+            可使用 `codex-provider restore <backup-dir>` 恢复本工具创建的备份。
+
+            ## 已知事项
+            含 encrypted_content 的历史会话跨 provider/account 后，通常只能恢复列表可见性；继续对话或 compact 仍可能失败。
