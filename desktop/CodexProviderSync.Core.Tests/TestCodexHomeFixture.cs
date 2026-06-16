@@ -39,6 +39,16 @@ internal sealed class TestCodexHomeFixture
         return Path.Combine(BackupRoot(), directoryName);
     }
 
+    public string StateDbPath()
+    {
+        return Path.Combine(CodexHome, AppConstants.SqliteDirBasename, AppConstants.DbFileBasename);
+    }
+
+    public string LegacyStateDbPath()
+    {
+        return Path.Combine(CodexHome, AppConstants.DbFileBasename);
+    }
+
     public async Task WriteConfigAsync(string modelProviderLine)
     {
         string prefix = string.IsNullOrWhiteSpace(modelProviderLine) ? string.Empty : modelProviderLine + "\n";
@@ -126,7 +136,6 @@ internal sealed class TestCodexHomeFixture
 
     public async Task WriteStateDbAsync(IEnumerable<(string Id, string ModelProvider, bool Archived)> rows)
     {
-        string dbPath = Path.Combine(CodexHome, "state_5.sqlite");
         await using SqliteConnection connection = OpenSqliteConnection();
         await connection.OpenAsync();
         SqliteCommand create = connection.CreateCommand();
@@ -157,7 +166,6 @@ internal sealed class TestCodexHomeFixture
 
     public async Task WriteStateDbWithUserEventColumnAsync(IEnumerable<(string Id, string ModelProvider, bool Archived, bool HasUserEvent)> rows)
     {
-        string dbPath = Path.Combine(CodexHome, "state_5.sqlite");
         await using SqliteConnection connection = OpenSqliteConnection();
         await connection.OpenAsync();
         SqliteCommand create = connection.CreateCommand();
@@ -290,6 +298,17 @@ internal sealed class TestCodexHomeFixture
 
     public SqliteConnection OpenSqliteConnection()
     {
-        return new SqliteConnection($"Data Source={Path.Combine(CodexHome, "state_5.sqlite")};Mode=ReadWriteCreate;Pooling=False");
+        return OpenSqliteConnection(StateDbPath());
+    }
+
+    public SqliteConnection OpenLegacySqliteConnection()
+    {
+        return OpenSqliteConnection(LegacyStateDbPath());
+    }
+
+    private static SqliteConnection OpenSqliteConnection(string dbPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+        return new SqliteConnection($"Data Source={dbPath};Mode=ReadWriteCreate;Pooling=False");
     }
 }

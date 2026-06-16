@@ -15,7 +15,9 @@ For normal Windows users, prefer the GUI app when it is available. Use the CLI w
 The tool works by updating both:
 
 - rollout metadata under `~/.codex/sessions` and `~/.codex/archived_sessions`
-- SQLite thread metadata in `~/.codex/state_5.sqlite`
+- SQLite thread metadata in the detected Codex state database, normally
+  `~/.codex/sqlite/state_5.sqlite` with legacy fallback to
+  `~/.codex/state_5.sqlite`
 
 Do not solve this by manually editing rollout files only unless the user explicitly asks for manual intervention.
 
@@ -32,7 +34,7 @@ Use this order by default:
 CLI fallback flow:
 
 1. Run `codex-provider status`
-2. Read `Current provider` and compare rollout/SQLite distribution
+2. Read `Current provider`, the displayed SQLite database path, and compare rollout/SQLite distribution
 3. Decide whether the user needs `sync`, `switch`, or `restore`
 4. Run the command
 5. Report whether the result is complete or partially skipped due to locked files
@@ -112,6 +114,9 @@ If `switch <provider-id>` fails because the provider is missing:
 ## Safe Defaults
 
 - default Codex home: `~/.codex`
+- detect the SQLite DB before reasoning about SQLite counts; recent Codex uses
+  `~/.codex/sqlite/state_5.sqlite`, while older layouts may use
+  `~/.codex/state_5.sqlite`
 - prefer `status` before destructive-looking operations, even though this tool only edits metadata
 - by default the tool keeps the most recent 5 managed backups
 - use GUI retention settings or CLI `--keep <n>` when the user wants a different retention count

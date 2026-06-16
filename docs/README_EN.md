@@ -27,7 +27,9 @@ Typical symptom:
 `codex-provider-sync` fixes that by updating both:
 
 - `~/.codex/sessions` and `~/.codex/archived_sessions`
-- `~/.codex/state_5.sqlite`
+- the Codex state database, usually `~/.codex/sqlite/state_5.sqlite`
+
+Older Codex layouts may still use `~/.codex/state_5.sqlite`; the tool detects the active location and reports it in `codex-provider status`.
 
 ## GUI For Windows
 
@@ -150,7 +152,7 @@ Quick mapping:
 ## Commands
 
 - `codex-provider status`
-  - shows current provider and provider distribution in rollout files and SQLite
+  - shows current provider, the detected SQLite database path, and provider distribution in rollout files and SQLite
 - `codex-provider sync`
   - syncs history to the current provider
   - `--provider <id>` overrides the target provider

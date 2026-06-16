@@ -27,6 +27,14 @@ public sealed class CoreIntegrationTests
         Assert.Equal(2, syncResult.ChangedSessionFiles);
         Assert.Empty(syncResult.SkippedLockedRolloutFiles);
         Assert.Equal(2, syncResult.SqliteRowsUpdated);
+        BackupMetadataFile backupMetadata = JsonSerializer.Deserialize<BackupMetadataFile>(
+            await File.ReadAllTextAsync(Path.Combine(syncResult.BackupDir, "metadata.json")),
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase })!;
+        Assert.Equal(
+        [
+            Path.Combine(AppConstants.SqliteDirBasename, AppConstants.DbFileBasename)
+        ],
+            backupMetadata.DbFiles);
 
         string syncedSession = await File.ReadAllTextAsync(sessionPath);
         string syncedArchived = await File.ReadAllTextAsync(archivedPath);
@@ -273,8 +281,44 @@ public sealed class CoreIntegrationTests
         Assert.True(status.CurrentProvider.Implicit);
         Assert.Equal(1, status.RolloutCounts.Sessions["apigather"]);
         Assert.Equal(1, status.SqliteCounts!.ArchivedSessions["openai"]);
+        Assert.NotNull(status.StateDbLocation);
+        Assert.Equal("sqlite-dir", status.StateDbLocation!.Source);
+        Assert.Equal(fixture.StateDbPath(), status.StateDbLocation.Path);
         Assert.Equal(2, status.BackupSummary.Count);
         Assert.Equal(backupOneBytes + backupTwoBytes, status.BackupSummary.TotalBytes);
+        Assert.Contains($"database: {fixture.StateDbPath()}", TextFormatter.FormatStatus(status));
+    }
+
+    [Fact]
+    public async Task GetStatus_FallsBackToLegacyRootSqliteDatabase()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync(string.Empty);
+        await using (SqliteConnection connection = fixture.OpenLegacySqliteConnection())
+        {
+            await connection.OpenAsync();
+            SqliteCommand create = connection.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE threads (
+                  id TEXT PRIMARY KEY,
+                  model_provider TEXT,
+                  archived INTEGER NOT NULL DEFAULT 0
+                )
+                """;
+            await create.ExecuteNonQueryAsync();
+            SqliteCommand insert = connection.CreateCommand();
+            insert.CommandText = "INSERT INTO threads (id, model_provider, archived) VALUES ('legacy-thread', 'openai', 0)";
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        CodexSyncService service = new();
+        StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
+
+        Assert.NotNull(status.StateDbLocation);
+        Assert.Equal("legacy-root", status.StateDbLocation!.Source);
+        Assert.Equal(fixture.LegacyStateDbPath(), status.StateDbLocation.Path);
+        Assert.Equal(1, status.SqliteCounts!.Sessions["openai"]);
+        Assert.Contains("legacy root", TextFormatter.FormatStatus(status));
     }
 
     [Fact]
@@ -744,7 +788,8 @@ public sealed class CoreIntegrationTests
     {
         TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
         await fixture.WriteConfigAsync("model_provider = \"openai\"");
-        await File.WriteAllTextAsync(Path.Combine(fixture.CodexHome, "state_5.sqlite"), "not sqlite");
+        Directory.CreateDirectory(Path.GetDirectoryName(fixture.StateDbPath())!);
+        await File.WriteAllTextAsync(fixture.StateDbPath(), "not sqlite");
 
         CodexSyncService service = new();
         StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
