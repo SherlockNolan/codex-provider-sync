@@ -44,7 +44,7 @@ public sealed class FocusRequestServer : IDisposable
         try
         {
             using NamedPipeClientStream client = new(".", PipeName, PipeDirection.Out, PipeOptions.None);
-            await client.ConnectAsync(timeout).ConfigureAwait(false);
+            await client.ConnectAsync((int)timeout.TotalMilliseconds).ConfigureAwait(false);
             using StreamWriter writer = new(client) { AutoFlush = true };
             await writer.WriteLineAsync("FOCUS").ConfigureAwait(false);
             return true;

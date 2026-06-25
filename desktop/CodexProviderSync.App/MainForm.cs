@@ -124,7 +124,7 @@ public sealed class MainForm : Form
     /// single-instance focus broker when a second copy of CodexProviderSync
     /// is launched and asks the first copy to take focus.
     /// </summary>
-    public void BringToFront()
+    public new void BringToFront()
     {
         if (InvokeRequired)
         {
