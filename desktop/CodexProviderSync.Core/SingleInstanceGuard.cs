@@ -35,16 +35,32 @@ public sealed class SingleInstanceGuard
     /// still alive?" so unit tests do not depend on a real running process.
     /// </summary>
     internal SingleInstanceGuard(Func<int, bool> isProcessAlive)
+        : this(isProcessAlive, DefaultLockDirectory())
+    {
+    }
+
+    /// <summary>
+    /// Test-only constructor: lets callers inject the lock directory and the
+    /// process probe. Use this to point the guard at a temp folder instead
+    /// of the user's real <c>%APPDATA%/codex-provider-sync/singleton</c>.
+    /// </summary>
+    internal SingleInstanceGuard(Func<int, bool> isProcessAlive, string lockDirectory)
     {
         IsProcessAlive = isProcessAlive;
+        LockDirectory = lockDirectory;
     }
 
     internal Func<int, bool> IsProcessAlive { get; }
 
-    public string LockDirectory { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "codex-provider-sync",
-        "singleton");
+    public string LockDirectory { get; }
+
+    private static string DefaultLockDirectory()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "codex-provider-sync",
+            "singleton");
+    }
 
     public SingleInstanceAcquisition Acquire(string label = "codex-provider-sync")
     {
@@ -147,7 +163,7 @@ public sealed class SingleInstanceGuard
     {
         return OperatingSystem.IsWindows()
             ? TryCreateDirectoryWindows(path)
-            : TryCreateDirectoryUnix(path);
+            : TryCreateDirectoryPosix(path);
     }
 
     internal static int TryCreateDirectoryWindows(string path)
@@ -155,17 +171,19 @@ public sealed class SingleInstanceGuard
         return CreateDirectory(path, IntPtr.Zero) ? 0 : Marshal.GetLastWin32Error();
     }
 
-    internal static int TryCreateDirectoryUnix(string path)
+    internal static int TryCreateDirectoryPosix(string path)
     {
-        if (Mkdir(path, 448) == 0)
+        // 448 = 0700 octal; only the owner needs to read/write/execute the
+        // singleton directory.
+        if (PosixMkdir(path, 448) == 0)
         {
             return 0;
         }
         int errorCode = Marshal.GetLastWin32Error();
         return errorCode switch
         {
-            17 => Win32ErrorAlreadyExists,
-            1 or 13 => Win32ErrorAccessDenied,
+            17 => Win32ErrorAlreadyExists,   // EEXIST
+            1 or 13 => Win32ErrorAccessDenied, // EPERM / EACCES
             _ => errorCode
         };
     }
@@ -173,8 +191,23 @@ public sealed class SingleInstanceGuard
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool CreateDirectory(string lpPathName, IntPtr lpSecurityAttributes);
 
-    [DllImport("libc", SetLastError = true, EntryPoint = "mkdir")]
-    private static extern int Mkdir(string pathname, uint mode);
+    // Linux: glibc ships mkdir in libc. macOS: the same symbol resolves
+    // through libSystem. Pin the EntryPoint and let the runtime pick the
+    // right library on each platform via the DllImportResolver. Without
+    // this, macOS hits an unresolved-symbol DllNotFoundException the
+    // moment we call into this path.
+    [DllImport("libc", EntryPoint = "mkdir", SetLastError = true)]
+    private static extern int LibcMkdir(string pathname, uint mode);
+
+    [DllImport("libSystem", EntryPoint = "mkdir", SetLastError = true)]
+    private static extern int LibSystemMkdir(string pathname, uint mode);
+
+    private static int PosixMkdir(string path, uint mode)
+    {
+        return OperatingSystem.IsMacOS()
+            ? LibSystemMkdir(path, mode)
+            : LibcMkdir(path, mode);
+    }
 
     private static bool IsTransientLockCreateError(int errorCode)
     {
@@ -194,11 +227,20 @@ public sealed class SingleInstanceGuard
         }
         catch (ArgumentException)
         {
+            // No process with that id.
             return false;
         }
         catch (InvalidOperationException)
         {
+            // The process has already exited by the time we touched it.
             return false;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            // On Linux the owner may belong to another user; we cannot
+            // query it, so treat it as "alive" to be safe and avoid
+            // stealing the lock out from under another user.
+            return true;
         }
     }
 }
