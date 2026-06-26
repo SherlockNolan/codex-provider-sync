@@ -19,6 +19,8 @@ public sealed class SingleInstanceGuard
     private const int Win32ErrorAccessDenied = 5;
     private const int DefaultCreateRetryCount = 3;
     private const int DefaultCreateRetryDelayMs = 75;
+    private const int RaceWindowRetryCount = 20;
+    private const int RaceWindowRetryDelayMs = 25;
 
     private static readonly JsonSerializerOptions OwnerJsonOptions = new()
     {
@@ -64,7 +66,20 @@ public sealed class SingleInstanceGuard
 
     public SingleInstanceAcquisition Acquire(string label = "codex-provider-sync")
     {
-        Directory.CreateDirectory(LockDirectory);
+        // The lock directory itself is the contested resource, so it
+        // must be created atomically below. Only its parent path
+        // should be pre-created — using `Directory.CreateDirectory`
+        // on the lock directory here would silently succeed on the
+        // first launch, which then makes the atomic `TryCreateDirectory`
+        // always report `Win32ErrorAlreadyExists` and route the first
+        // caller into the stale-lock recovery branch. Two concurrent
+        // launches could then race deleting each other's lock dir and
+        // violate the single-instance guarantee.
+        string? parentDirectory = Path.GetDirectoryName(LockDirectory);
+        if (!string.IsNullOrEmpty(parentDirectory))
+        {
+            Directory.CreateDirectory(parentDirectory);
+        }
 
         int attempts = 0;
         while (true)
@@ -105,6 +120,43 @@ public sealed class SingleInstanceGuard
                     existingOwner: owner,
                     lockDirectory: LockDirectory,
                     guard: this);
+            }
+
+            // If the lock dir exists but `owner.json` is missing
+            // we have two possible cases:
+//   (a) race window — the winning process atomically created
+//       the lock dir but has not yet finished writing
+//       `owner.json`. Do NOT delete the directory here; that
+//       would race the winner's write and produce a
+//       stale-lock IOException in both processes. Back off
+//       briefly and let the winner finish.
+//   (b) stale leftover — the previous owner died (or crashed)
+//       and left behind arbitrary files (e.g., an unowned
+//       `BLOCK` file from an interrupted cleanup). The lock
+//       directory contains entries that are not `owner.json`,
+//       so we can safely delete and reclaim.
+// We disambiguate by checking the lock dir's contents: an
+// empty lock dir signals the race window; a non-empty lock
+// dir with no `owner.json` signals stale leftover. We give
+// the race-window case a much larger retry budget (20 × 25 ms
+// = 500 ms) than the default because the winner's write of a
+// few-KB JSON file under anti-virus / filesystem contention
+// can easily exceed a couple hundred milliseconds on Windows.
+if (owner is null)
+            {
+                bool lockDirHasLeftovers = HasLockDirLeftovers();
+                if (!lockDirHasLeftovers)
+                {
+                    attempts += 1;
+                    if (attempts >= RaceWindowRetryCount)
+                    {
+                        throw new IOException(
+                            $"Single-instance lock at {LockDirectory} exists but its owner metadata has not appeared yet. The owning process may be hung or under load.");
+                    }
+                    System.Threading.Thread.Sleep(RaceWindowRetryDelayMs);
+                    continue;
+                }
+                // Fall through to the stale-leftover delete branch.
             }
 
             // Stale lock (previous owner died or wrote no metadata). Best-effort
@@ -212,6 +264,43 @@ public sealed class SingleInstanceGuard
     private static bool IsTransientLockCreateError(int errorCode)
     {
         return errorCode == Win32ErrorAccessDenied;
+    }
+
+    // True when the lock directory exists, `owner.json` is not
+    // present, and there is at least one other entry inside the
+    // lock directory. Used to tell apart the "race window"
+    // (lock dir is empty, winner is mid-write) from the
+    // "stale leftover" (previous owner crashed and left
+    // arbitrary files behind) cases without trusting timing.
+    private bool HasLockDirLeftovers()
+    {
+        try
+        {
+            if (!Directory.Exists(LockDirectory))
+            {
+                return false;
+            }
+            foreach (string entry in Directory.EnumerateFileSystemEntries(LockDirectory))
+            {
+                string name = Path.GetFileName(entry);
+                if (!string.Equals(name, "owner.json", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        catch (IOException)
+        {
+            // Treat unreadable lock dirs as "leftovers" so the
+            // caller can attempt the stale-delete branch rather
+            // than spinning in the race-window backoff.
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 
     internal static bool StandardOwnerProbe(int processId)

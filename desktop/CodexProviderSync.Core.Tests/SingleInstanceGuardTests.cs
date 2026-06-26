@@ -1,3 +1,10 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
 namespace CodexProviderSync.Core.Tests;
 
 public sealed class SingleInstanceGuardTests
@@ -145,6 +152,113 @@ public sealed class SingleInstanceGuardTests
             using SingleInstanceAcquisition secondAcq = second.Acquire("second");
             Assert.True(secondAcq.IsOwner);
             Assert.False(File.Exists(Path.Combine(lockDir, "BLOCK")));
+        }
+        finally
+        {
+            Cleanup(settingsRoot);
+        }
+    }
+
+    [Fact]
+    public void Acquire_FirstCallOnSharedParentDirCreatesLockDirAtomically_AndSecondCallSeesExistingOwner()
+    {
+        // Regression guard: previously `Acquire` called
+        // `Directory.CreateDirectory(LockDirectory)` first, which
+        // recursively creates the lock dir on the very first
+        // launch. The follow-up atomic `TryCreateDirectory(LockDirectory)`
+        // then always returned `Win32ErrorAlreadyExists` and
+        // routed the first caller into the stale-lock recovery
+        // branch. With the fix, only the parent directory is
+        // pre-created; the lock dir itself is created atomically
+        // by `TryCreateDirectory`, so the first launch takes the
+        // owner branch directly without touching the recovery
+        // path. We verify both halves of that contract here:
+        //
+        //   1. The very first call writes `owner.json` (i.e.
+        //      took the atomic-create success branch, not the
+        //      stale-recovery branch).
+        //   2. A second call, when the lock dir already exists
+        //      and owner.json names a live pid, returns
+        //      `IsOwner == false` instead of clearing the lock
+        //      and reclaiming it.
+        //
+        // We cannot use two callers in the same test process
+        // because `Environment.ProcessId` is constant for the
+        // whole process — a second in-process `Acquire` would
+        // see its own pid in the just-written `owner.json` and
+        // fall into the stale-recovery branch (a Windows pid
+        // recycle scenario, not a real concurrent-launch race).
+        // Instead, we seed `owner.json` with a fictitious live
+        // pid and let the second caller observe it. This is
+        // exactly what a concurrent launch from another process
+        // looks like at the filesystem level.
+        string settingsRoot = Path.Combine(Path.GetTempPath(), $"codex-provider-singleton-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(settingsRoot);
+        string lockDir = Path.Combine(settingsRoot, "singleton");
+        try
+        {
+            // First caller: lockDir does not exist yet, the
+            // atomic `TryCreateDirectory` must succeed and we
+            // must take the owner branch.
+            SingleInstanceGuard firstGuard = new(static _ => true, lockDir);
+            using SingleInstanceAcquisition firstAcq = firstGuard.Acquire("first");
+            Assert.True(firstAcq.IsOwner);
+            Assert.Null(firstAcq.ExistingOwner);
+            Assert.True(File.Exists(Path.Combine(lockDir, "owner.json")),
+                "first caller must take the atomic-create success branch and write owner.json directly");
+            firstAcq.Dispose();
+
+            // Seed `owner.json` with a fictitious live pid so
+            // the second caller observes the existing-owner
+            // branch instead of the pid-recycle stale branch.
+            // We use `pid = 1` (system init / PID 1 is always
+            // alive on Windows/Linux/macOS for the duration of
+            // any test run) and a probe that returns true for
+            // any pid.
+            Directory.CreateDirectory(lockDir);
+            File.WriteAllText(Path.Combine(lockDir, "owner.json"),
+                "{\"processId\":1,\"startedAt\":\"2026-01-01T00:00:00+00:00\",\"label\":\"existing\",\"currentDirectory\":\"C:\\\\\"}");
+
+            SingleInstanceGuard secondGuard = new(static _ => true, lockDir);
+            using SingleInstanceAcquisition secondAcq = secondGuard.Acquire("second");
+            Assert.False(secondAcq.IsOwner);
+            Assert.NotNull(secondAcq.ExistingOwner);
+            Assert.Equal(1, secondAcq.ExistingOwner!.ProcessId);
+            Assert.True(File.Exists(Path.Combine(lockDir, "owner.json")),
+                "second caller must not delete the lock directory when the owner is still alive");
+        }
+        finally
+        {
+            Cleanup(settingsRoot);
+        }
+    }
+
+    [Fact]
+    public void Acquire_PidRecycleInOwnerJson_TreatedAsStaleAndReclaimed()
+    {
+        // Companion regression guard: when `owner.json`
+        // contains a pid that matches the current process but
+        // the process did NOT actually take the lock (e.g.,
+        // Windows reused our pid for a brand-new process while
+        // the previous owner crashed mid-write), the guard
+        // must treat that as stale and reclaim the lock. The
+        // signal we use is: the lock dir contains an
+        // `owner.json` with our pid but no leftover file from
+        // a partial write, and a probe that says the pid is
+        // dead. We hand-craft that scenario here.
+        string settingsRoot = Path.Combine(Path.GetTempPath(), $"codex-provider-singleton-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(settingsRoot);
+        string lockDir = Path.Combine(settingsRoot, "singleton");
+        try
+        {
+            Directory.CreateDirectory(lockDir);
+            File.WriteAllText(Path.Combine(lockDir, "owner.json"),
+                $"{{\"processId\":{Environment.ProcessId},\"startedAt\":\"2026-01-01T00:00:00+00:00\",\"label\":\"dead-recycle\",\"currentDirectory\":\"C:\\\\\"}}");
+
+            SingleInstanceGuard guard = new(static _ => false, lockDir);
+            using SingleInstanceAcquisition acq = guard.Acquire("recycled");
+            Assert.True(acq.IsOwner);
+            Assert.Null(acq.ExistingOwner);
         }
         finally
         {
