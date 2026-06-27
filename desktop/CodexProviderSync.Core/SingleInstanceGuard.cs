@@ -17,8 +17,15 @@ public sealed class SingleInstanceGuard
 {
     private const int Win32ErrorAlreadyExists = 183;
     private const int Win32ErrorAccessDenied = 5;
-    private const int DefaultCreateRetryCount = 3;
-    private const int DefaultCreateRetryDelayMs = 75;
+    private const int Win32ErrorSharingViolation = 32;
+    private const int Win32ErrorLockViolation = 33;
+    // The previous default budget (3 × 75 ms = 225 ms) was too tight for
+    // Windows Defender / OneDrive / antivirus file-locking drivers which
+    // can hold the directory open for several seconds on first launch.
+    // 30 × 100 ms = 3 s gives the OS enough breathing room to release
+    // the lock without making genuine failures drag on indefinitely.
+    private const int DefaultCreateRetryCount = 30;
+    private const int DefaultCreateRetryDelayMs = 100;
     private const int RaceWindowRetryCount = 20;
     private const int RaceWindowRetryDelayMs = 25;
 
@@ -263,7 +270,15 @@ if (owner is null)
 
     private static bool IsTransientLockCreateError(int errorCode)
     {
-        return errorCode == Win32ErrorAccessDenied;
+        // Access-denied, sharing-violation, and lock-violation are
+        // all transient Windows errors that mean "the lock directory
+        // is currently held by another process". Anti-virus and
+        // cloud-sync drivers often hold these for a few seconds on
+        // first launch; retrying through the default budget lets the
+        // OS release them without surfacing an error to the user.
+        return errorCode == Win32ErrorAccessDenied
+            || errorCode == Win32ErrorSharingViolation
+            || errorCode == Win32ErrorLockViolation;
     }
 
     // True when the lock directory exists, `owner.json` is not
