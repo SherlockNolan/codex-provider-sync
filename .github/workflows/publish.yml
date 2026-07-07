@@ -57,6 +57,11 @@ jobs:
           files: |
             artifacts/release/*
           body: |
+            ## Windows SmartScreen 提示
+            当前 Windows GUI 未做代码签名，首次运行时可能提示“发布者未知”或“Windows 已保护你的电脑”。这是未签名 EXE 的常见提示。
+
+            请确认下载来源是本项目 GitHub Releases，并可用随附的 SHA256 文件校验后运行。
+
             ## 安全边界
             - 不会修改 auth.json
             - 不会改写对话正文或消息历史
