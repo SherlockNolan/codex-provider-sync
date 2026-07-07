@@ -71,6 +71,69 @@ public sealed class CoreIntegrationTests
     }
 
     [Fact]
+    public async Task RunSync_UpdatesLegacyRootSqliteDatabase_WhenSqliteDirStateIsStale()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync("model_provider = \"openai\"");
+        string sessionPath = fixture.RolloutPath("sessions", "rollout-active-a.jsonl");
+        string archivedPath = fixture.RolloutPath("archived_sessions", "rollout-active-b.jsonl");
+        await fixture.WriteRolloutAsync(sessionPath, "thread-active-a", "dal");
+        await fixture.WriteRolloutAsync(archivedPath, "thread-active-b", "dal");
+        await fixture.WriteStateDbAsync(
+        [
+            ("thread-active-a", "dal", false)
+        ]);
+        await fixture.WriteLegacyStateDbAsync(
+        [
+            ("thread-active-a", "dal", false),
+            ("thread-active-b", "dal", true)
+        ]);
+
+        CodexSyncService service = new();
+        SyncResult syncResult = await service.RunSyncAsync(fixture.CodexHome);
+
+        Assert.Equal(2, syncResult.SqliteRowsUpdated);
+        BackupMetadataFile backupMetadata = JsonSerializer.Deserialize<BackupMetadataFile>(
+            await File.ReadAllTextAsync(Path.Combine(syncResult.BackupDir, "metadata.json")),
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase })!;
+        Assert.Equal([AppConstants.DbFileBasename], backupMetadata.DbFiles);
+
+        await using (SqliteConnection connection = fixture.OpenLegacySqliteConnection())
+        {
+            await connection.OpenAsync();
+            SqliteCommand command = connection.CreateCommand();
+            command.CommandText = "SELECT id, model_provider FROM threads ORDER BY id";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+            List<(string Id, string Provider)> rows = [];
+            while (await reader.ReadAsync())
+            {
+                rows.Add((reader.GetString(0), reader.GetString(1)));
+            }
+
+            Assert.Equal(
+            [
+                ("thread-active-a", "openai"),
+                ("thread-active-b", "openai")
+            ], rows);
+        }
+
+        await using (SqliteConnection connection = fixture.OpenSqliteConnection())
+        {
+            await connection.OpenAsync();
+            SqliteCommand command = connection.CreateCommand();
+            command.CommandText = "SELECT id, model_provider FROM threads ORDER BY id";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+            List<(string Id, string Provider)> rows = [];
+            while (await reader.ReadAsync())
+            {
+                rows.Add((reader.GetString(0), reader.GetString(1)));
+            }
+
+            Assert.Equal([("thread-active-a", "dal")], rows);
+        }
+    }
+
+    [Fact]
     public async Task RunSwitch_UpdatesConfigAndSyncsProviderMetadata()
     {
         TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
@@ -319,6 +382,45 @@ public sealed class CoreIntegrationTests
         Assert.Equal("legacy-root", status.StateDbLocation!.Source);
         Assert.Equal(fixture.LegacyStateDbPath(), status.StateDbLocation.Path);
         Assert.Equal(1, status.SqliteCounts!.Sessions["openai"]);
+        Assert.Contains("legacy root", TextFormatter.FormatStatus(status));
+    }
+
+    [Fact]
+    public async Task GetStatus_ChoosesLegacyRootSqliteDatabase_WhenSqliteDirStateIsStale()
+    {
+        TestCodexHomeFixture fixture = await TestCodexHomeFixture.CreateAsync();
+        await fixture.WriteConfigAsync(string.Empty);
+        await fixture.WriteRolloutAsync(
+            fixture.RolloutPath("sessions", "rollout-active-a.jsonl"),
+            "thread-active-a",
+            "openai");
+        await fixture.WriteRolloutAsync(
+            fixture.RolloutPath("sessions", "rollout-active-b.jsonl"),
+            "thread-active-b",
+            "openai");
+        await fixture.WriteRolloutAsync(
+            fixture.RolloutPath("archived_sessions", "rollout-active-c.jsonl"),
+            "thread-active-c",
+            "openai");
+        await fixture.WriteStateDbAsync(
+        [
+            ("thread-active-a", "custom", false)
+        ]);
+        await fixture.WriteLegacyStateDbAsync(
+        [
+            ("thread-active-a", "openai", false),
+            ("thread-active-b", "openai", false),
+            ("thread-active-c", "openai", true)
+        ]);
+
+        CodexSyncService service = new();
+        StatusSnapshot status = await service.GetStatusAsync(fixture.CodexHome);
+
+        Assert.NotNull(status.StateDbLocation);
+        Assert.Equal("legacy-root", status.StateDbLocation!.Source);
+        Assert.Equal(fixture.LegacyStateDbPath(), status.StateDbLocation.Path);
+        Assert.Equal(2, status.SqliteCounts!.Sessions["openai"]);
+        Assert.Equal(1, status.SqliteCounts.ArchivedSessions["openai"]);
         Assert.Contains("legacy root", TextFormatter.FormatStatus(status));
     }
 
