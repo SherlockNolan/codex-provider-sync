@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { DB_FILE_BASENAME, SQLITE_DIR_BASENAME } from "./constants.js";
+import { DB_FILE_BASENAME, SESSION_DIRS, SQLITE_DIR_BASENAME } from "./constants.js";
 import { openDatabase } from "./sqlite.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
@@ -29,16 +29,129 @@ export function stateDbCandidates(codexHome) {
   ];
 }
 
+async function countRolloutFilesInDir(rootDir) {
+  let entries;
+  try {
+    entries = await fs.readdir(rootDir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+
+  let count = 0;
+  for (const entry of entries) {
+    const fullPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      count += await countRolloutFilesInDir(fullPath);
+      continue;
+    }
+    if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+async function countRolloutFiles(codexHome) {
+  let count = 0;
+  for (const dirname of SESSION_DIRS) {
+    count += await countRolloutFilesInDir(path.join(codexHome, dirname));
+  }
+  return count;
+}
+
+function tableExists(db, tableName) {
+  return Boolean(db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName));
+}
+
+function maxThreadTimestampMs(db) {
+  if (tableHasColumn(db, "threads", "updated_at_ms")) {
+    return Number(db.prepare("SELECT COALESCE(MAX(updated_at_ms), 0) AS value FROM threads").get().value) || 0;
+  }
+  if (tableHasColumn(db, "threads", "updated_at")) {
+    return (Number(db.prepare("SELECT COALESCE(MAX(updated_at), 0) AS value FROM threads").get().value) || 0) * 1000;
+  }
+  if (tableHasColumn(db, "threads", "created_at_ms")) {
+    return Number(db.prepare("SELECT COALESCE(MAX(created_at_ms), 0) AS value FROM threads").get().value) || 0;
+  }
+  if (tableHasColumn(db, "threads", "created_at")) {
+    return (Number(db.prepare("SELECT COALESCE(MAX(created_at), 0) AS value FROM threads").get().value) || 0) * 1000;
+  }
+  return 0;
+}
+
+async function readStateDbCandidateStats(candidate, priority) {
+  let db;
+  try {
+    db = await openDatabase(candidate.path, { readOnly: true });
+    if (!tableExists(db, "threads")) {
+      throw new Error("threads table not found");
+    }
+    const threadCount = Number(db.prepare("SELECT COUNT(*) AS count FROM threads").get().count) || 0;
+    return {
+      candidate,
+      priority,
+      threadCount,
+      maxThreadTimestampMs: maxThreadTimestampMs(db),
+      mtimeMs: (await fs.stat(candidate.path)).mtimeMs
+    };
+  } finally {
+    db?.close();
+  }
+}
+
+function compareStateDbCandidateStats(a, b) {
+  if (a.rolloutDistance !== b.rolloutDistance) {
+    return a.rolloutDistance - b.rolloutDistance;
+  }
+  if (a.threadCount !== b.threadCount) {
+    return b.threadCount - a.threadCount;
+  }
+  if (a.maxThreadTimestampMs !== b.maxThreadTimestampMs) {
+    return b.maxThreadTimestampMs - a.maxThreadTimestampMs;
+  }
+  if (a.mtimeMs !== b.mtimeMs) {
+    return b.mtimeMs - a.mtimeMs;
+  }
+  return a.priority - b.priority;
+}
+
 export async function detectStateDb(codexHome) {
-  for (const candidate of stateDbCandidates(codexHome)) {
+  const existingCandidates = [];
+  const candidates = stateDbCandidates(codexHome);
+  for (const [priority, candidate] of candidates.entries()) {
     try {
       await fs.access(candidate.path);
-      return candidate;
+      existingCandidates.push({ candidate, priority });
     } catch {
       // Try the next known Codex state DB location.
     }
   }
-  return null;
+  if (existingCandidates.length === 0) {
+    return null;
+  }
+
+  const rolloutCount = await countRolloutFiles(codexHome);
+  const readableCandidates = [];
+  for (const { candidate, priority } of existingCandidates) {
+    try {
+      const stats = await readStateDbCandidateStats(candidate, priority);
+      readableCandidates.push({
+        ...stats,
+        rolloutDistance: rolloutCount > 0 ? Math.abs(stats.threadCount - rolloutCount) : 0
+      });
+    } catch {
+      // Keep unreadable candidates as a fallback so existing status/error
+      // handling still points at state_5.sqlite when no usable DB exists.
+    }
+  }
+
+  if (readableCandidates.length === 0) {
+    return existingCandidates[0].candidate;
+  }
+
+  return readableCandidates.sort(compareStateDbCandidateStats)[0].candidate;
 }
 
 export async function existingStateDbPath(codexHome) {

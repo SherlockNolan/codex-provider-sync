@@ -136,7 +136,17 @@ internal sealed class TestCodexHomeFixture
 
     public async Task WriteStateDbAsync(IEnumerable<(string Id, string ModelProvider, bool Archived)> rows)
     {
-        await using SqliteConnection connection = OpenSqliteConnection();
+        await WriteStateDbAtAsync(StateDbPath(), rows);
+    }
+
+    public async Task WriteLegacyStateDbAsync(IEnumerable<(string Id, string ModelProvider, bool Archived)> rows)
+    {
+        await WriteStateDbAtAsync(LegacyStateDbPath(), rows);
+    }
+
+    private static async Task WriteStateDbAtAsync(string dbPath, IEnumerable<(string Id, string ModelProvider, bool Archived)> rows)
+    {
+        await using SqliteConnection connection = OpenSqliteConnection(dbPath);
         await connection.OpenAsync();
         SqliteCommand create = connection.CreateCommand();
         create.CommandText = """

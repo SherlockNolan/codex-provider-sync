@@ -6,6 +6,14 @@ public sealed class SqliteStateService
 {
     private const int DefaultBusyTimeoutMs = 5000;
 
+    private sealed record StateDbCandidateStats(
+        StateDbLocation Location,
+        int Priority,
+        long ThreadCount,
+        long MaxThreadTimestampMs,
+        long LastWriteTimeUtcTicks,
+        long RolloutDistance);
+
     static SqliteStateService()
     {
         SQLitePCL.Batteries_V2.Init();
@@ -38,15 +46,51 @@ public sealed class SqliteStateService
 
     public StateDbLocation? DetectStateDb(string codexHome)
     {
-        foreach (StateDbLocation candidate in StateDbCandidates(codexHome))
+        List<(StateDbLocation Location, int Priority)> existingCandidates = [];
+        IReadOnlyList<StateDbLocation> candidates = StateDbCandidates(codexHome);
+        for (int index = 0; index < candidates.Count; index += 1)
         {
+            StateDbLocation candidate = candidates[index];
             if (File.Exists(candidate.Path))
             {
-                return candidate;
+                existingCandidates.Add((candidate, index));
             }
         }
 
-        return null;
+        if (existingCandidates.Count == 0)
+        {
+            return null;
+        }
+
+        long rolloutCount = CountRolloutFiles(codexHome);
+        List<StateDbCandidateStats> readableCandidates = [];
+        foreach ((StateDbLocation candidate, int priority) in existingCandidates)
+        {
+            try
+            {
+                StateDbCandidateStats stats = ReadStateDbCandidateStats(candidate, priority, rolloutCount);
+                readableCandidates.Add(stats);
+            }
+            catch
+            {
+                // Keep unreadable candidates as a fallback so existing status/error
+                // handling still points at state_5.sqlite when no usable DB exists.
+            }
+        }
+
+        if (readableCandidates.Count == 0)
+        {
+            return existingCandidates[0].Location;
+        }
+
+        return readableCandidates
+            .OrderBy(static candidate => candidate.RolloutDistance)
+            .ThenByDescending(static candidate => candidate.ThreadCount)
+            .ThenByDescending(static candidate => candidate.MaxThreadTimestampMs)
+            .ThenByDescending(static candidate => candidate.LastWriteTimeUtcTicks)
+            .ThenBy(static candidate => candidate.Priority)
+            .First()
+            .Location;
     }
 
     public string? ExistingStateDbPath(string codexHome)
@@ -331,6 +375,98 @@ public sealed class SqliteStateService
         return new SqliteConnection(builder.ConnectionString);
     }
 
+    private static long CountRolloutFiles(string codexHome)
+    {
+        long count = 0;
+        foreach (string directory in AppConstants.SessionDirectories)
+        {
+            count += CountRolloutFilesInDirectory(Path.Combine(codexHome, directory));
+        }
+
+        return count;
+    }
+
+    private static long CountRolloutFilesInDirectory(string rootDir)
+    {
+        if (!Directory.Exists(rootDir))
+        {
+            return 0;
+        }
+
+        try
+        {
+            return Directory
+                .EnumerateFiles(rootDir, "rollout-*.jsonl", SearchOption.AllDirectories)
+                .LongCount();
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static StateDbCandidateStats ReadStateDbCandidateStats(
+        StateDbLocation candidate,
+        int priority,
+        long rolloutCount)
+    {
+        using SqliteConnection connection = OpenConnection(candidate.Path, SqliteOpenMode.ReadOnly);
+        connection.Open();
+        if (!TableExists(connection, "threads"))
+        {
+            throw new InvalidOperationException("threads table not found");
+        }
+
+        long threadCount = ExecuteScalarLong(connection, "SELECT COUNT(*) FROM threads");
+        long rolloutDistance = rolloutCount > 0 ? Math.Abs(threadCount - rolloutCount) : 0;
+        return new StateDbCandidateStats(
+            candidate,
+            priority,
+            threadCount,
+            MaxThreadTimestampMs(connection),
+            File.GetLastWriteTimeUtc(candidate.Path).Ticks,
+            rolloutDistance);
+    }
+
+    private static bool TableExists(SqliteConnection connection, string tableName)
+    {
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name";
+        command.Parameters.AddWithValue("$name", tableName);
+        object? value = command.ExecuteScalar();
+        return value is not null && value is not DBNull;
+    }
+
+    private static long MaxThreadTimestampMs(SqliteConnection connection)
+    {
+        if (TableHasColumn(connection, "threads", "updated_at_ms"))
+        {
+            return ExecuteScalarLong(connection, "SELECT COALESCE(MAX(updated_at_ms), 0) FROM threads");
+        }
+        if (TableHasColumn(connection, "threads", "updated_at"))
+        {
+            return ExecuteScalarLong(connection, "SELECT COALESCE(MAX(updated_at), 0) FROM threads") * 1000;
+        }
+        if (TableHasColumn(connection, "threads", "created_at_ms"))
+        {
+            return ExecuteScalarLong(connection, "SELECT COALESCE(MAX(created_at_ms), 0) FROM threads");
+        }
+        if (TableHasColumn(connection, "threads", "created_at"))
+        {
+            return ExecuteScalarLong(connection, "SELECT COALESCE(MAX(created_at), 0) FROM threads") * 1000;
+        }
+
+        return 0;
+    }
+
+    private static long ExecuteScalarLong(SqliteConnection connection, string commandText)
+    {
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = commandText;
+        object? value = command.ExecuteScalar();
+        return value is null || value is DBNull ? 0 : Convert.ToInt64(value);
+    }
+
     private static async Task SetBusyTimeoutAsync(SqliteConnection connection, int? busyTimeoutMs)
     {
         int timeout = busyTimeoutMs is >= 0 ? busyTimeoutMs.Value : DefaultBusyTimeoutMs;
@@ -350,6 +486,22 @@ public sealed class SqliteStateService
         command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)})";
         await using SqliteDataReader reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TableHasColumn(SqliteConnection connection, string tableName, string columnName)
+    {
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({QuoteIdentifier(tableName)})";
+        using SqliteDataReader reader = command.ExecuteReader();
+        while (reader.Read())
         {
             if (string.Equals(reader.GetString(1), columnName, StringComparison.Ordinal))
             {
