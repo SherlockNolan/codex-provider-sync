@@ -127,6 +127,20 @@ Without an explicit path, export writes `codex-history_YYYYMMDD_HHMMSS.tgz` in t
 codex-provider export codex-history.tgz
 ```
 
+To migrate only selected conversations, preview first and choose by number:
+
+```bash
+codex-provider export --select
+```
+
+The browser shows thread id, active/archived state, provider, timestamp, first user message preview, cwd, and rollout path. Type to search, use `Up/Down` to browse, `Space` to toggle selection, `Left/Right` or `PageUp/PageDown` to page, `Enter` to export, and `Esc` to exit.
+
+For automation, pass thread ids directly:
+
+```bash
+codex-provider export selected-history.tgz --ids thread-a,thread-b
+```
+
 Import that archive on another device:
 
 ```bash
@@ -190,9 +204,12 @@ Quick mapping:
 - `codex-provider export [archive-path]`
   - exports `sessions`, `archived_sessions`, and detected SQLite thread metadata to a `.tgz` archive
   - defaults to `codex-history_YYYYMMDD_HHMMSS.tgz` in the current terminal directory
+  - `--select` previews conversations and interactively chooses what to export
+  - `--ids <id[,id]>` exports only specific thread ids
   - use `--overwrite` to replace an existing archive file
 - `codex-provider import <archive-path>`
   - imports a history archive on another device
+  - incrementally merges only the records present in the archive
   - defaults imported records to the destination current provider
   - `--provider <id>` overrides the import provider
   - `--conflict ask|skip|overwrite|fail` controls same-thread conflicts
@@ -217,6 +234,8 @@ codex-provider sync --provider openai
 codex-provider switch openai
 codex-provider switch apigather
 codex-provider export
+codex-provider export --select
+codex-provider export selected-history.tgz --ids thread-a,thread-b
 codex-provider import codex-history.tgz
 codex-provider import codex-history.tgz --provider openai --conflict ask
 codex-provider prune-backups --keep 5

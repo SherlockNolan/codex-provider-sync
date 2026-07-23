@@ -168,6 +168,16 @@ function summarizeSqliteRow(row, sourceColumns = []) {
   };
 }
 
+function buildExportKey(rollout) {
+  return rollout.threadId ? `thread:${rollout.threadId}` : `path:${rollout.relativePath}`;
+}
+
+function selectedThreadIdsFromRollouts(rollouts) {
+  return rollouts
+    .map((rollout) => rollout.threadId)
+    .filter((threadId) => typeof threadId === "string" && threadId);
+}
+
 export async function collectRolloutInventory(codexHome) {
   const rollouts = [];
   for (const scope of SESSION_DIRS) {
@@ -231,10 +241,72 @@ async function copyStateDbToStaging(codexHome, stagingDir) {
   return copied;
 }
 
+async function pruneStagedStateDb(stagingDir, dbFiles, selectedThreadIds) {
+  if (!selectedThreadIds) {
+    return dbFiles;
+  }
+  const baseFile = dbFiles.find((fileName) => path.basename(fileName) === DB_FILE_BASENAME);
+  if (!baseFile) {
+    return [];
+  }
+
+  const dbPath = resolveArchivePath(stagingDir, path.join("db", baseFile));
+  let db;
+  try {
+    db = await openDatabase(dbPath);
+    if (tableExists(db, "threads")) {
+      if (selectedThreadIds.length === 0) {
+        db.prepare("DELETE FROM threads").run();
+      } else {
+        const placeholders = selectedThreadIds.map(() => "?").join(", ");
+        db.prepare(`DELETE FROM threads WHERE id NOT IN (${placeholders})`).run(...selectedThreadIds);
+      }
+    }
+  } finally {
+    db?.close();
+  }
+
+  for (const dbFile of dbFiles) {
+    if (dbFile !== baseFile) {
+      await fs.rm(resolveArchivePath(stagingDir, path.join("db", dbFile)), { force: true });
+    }
+  }
+  return [baseFile];
+}
+
+export async function buildExportPreview(codexHome) {
+  const rollouts = await collectRolloutInventory(codexHome);
+  const localThreads = await readLocalThreads(codexHome);
+  const rowsById = mapRowsById(localThreads.rows);
+  const sortedRollouts = [...rollouts].sort((left, right) => (
+    String(right.timestamp ?? "").localeCompare(String(left.timestamp ?? ""))
+    || left.relativePath.localeCompare(right.relativePath)
+  ));
+  return sortedRollouts.map((rollout, index) => {
+    const sqlite = rollout.threadId ? rowsById.get(rollout.threadId) : null;
+    return {
+      index: index + 1,
+      key: buildExportKey(rollout),
+      threadId: rollout.threadId,
+      scope: rollout.scope,
+      provider: rollout.provider ?? sqlite?.model_provider ?? "(missing)",
+      cwd: rollout.cwd ?? sqlite?.cwd ?? "",
+      timestamp: rollout.timestamp
+        ?? sqlite?.updated_at_ms
+        ?? sqlite?.created_at_ms
+        ?? "",
+      firstUserMessage: sqlite?.first_user_message ?? "",
+      relativePath: rollout.relativePath,
+      size: rollout.size
+    };
+  });
+}
+
 export async function createHistoryArchive({
   codexHome,
   archivePath,
-  overwrite = false
+  overwrite = false,
+  selectionKeys
 }) {
   const resolvedArchivePath = path.resolve(archivePath);
   if (await pathExists(resolvedArchivePath)) {
@@ -247,15 +319,28 @@ export async function createHistoryArchive({
   await fs.mkdir(path.dirname(resolvedArchivePath), { recursive: true });
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-export-"));
   try {
-    const rollouts = await collectRolloutInventory(codexHome);
+    const allRollouts = await collectRolloutInventory(codexHome);
+    const selectedKeySet = selectionKeys ? new Set(selectionKeys) : null;
+    const rollouts = selectedKeySet
+      ? allRollouts.filter((rollout) => selectedKeySet.has(buildExportKey(rollout)))
+      : allRollouts;
+    if (selectedKeySet && rollouts.length === 0) {
+      throw new Error("No conversations matched the selected export items.");
+    }
     await copyRolloutsToStaging(codexHome, stagingDir, rollouts);
     const globalStateFiles = await copyGlobalStateToStaging(codexHome, stagingDir);
-    const dbFiles = await copyStateDbToStaging(codexHome, stagingDir);
+    const copiedDbFiles = await copyStateDbToStaging(codexHome, stagingDir);
+    const dbFiles = await pruneStagedStateDb(
+      stagingDir,
+      copiedDbFiles,
+      selectedKeySet ? selectedThreadIdsFromRollouts(rollouts) : null
+    );
     const manifest = {
       version: HISTORY_VERSION,
       namespace: HISTORY_NAMESPACE,
       createdAt: new Date().toISOString(),
       codexHome,
+      selected: Boolean(selectedKeySet),
       rollouts,
       dbFiles,
       globalStateFiles
@@ -280,6 +365,7 @@ export async function createHistoryArchive({
       rolloutFiles: rollouts.length,
       dbFiles: dbFiles.length,
       globalStateFiles: globalStateFiles.length,
+      selected: Boolean(selectedKeySet),
       bytes: stat.size
     };
   } finally {

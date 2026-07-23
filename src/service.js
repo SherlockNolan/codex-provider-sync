@@ -44,6 +44,7 @@ import {
   syncWorkspaceRoots
 } from "./workspace-roots.js";
 import {
+  buildExportPreview,
   buildImportPlan,
   cleanupExtractedHistory,
   copyImportedRollouts,
@@ -115,6 +116,23 @@ function formatLocalTimestampForFileName(date = new Date()) {
 
 export function defaultHistoryArchivePath(date = new Date()) {
   return path.resolve(process.cwd(), `codex-history_${formatLocalTimestampForFileName(date)}.tgz`);
+}
+
+export function parseExportThreadIds(rawValue) {
+  if (rawValue === undefined) {
+    return null;
+  }
+  if (rawValue === true) {
+    throw new Error("Missing --ids value. Expected comma-separated thread ids.");
+  }
+  const ids = String(rawValue)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (ids.length === 0) {
+    throw new Error("Missing --ids value. Expected comma-separated thread ids.");
+  }
+  return ids;
 }
 
 function buildEncryptedContentWarning(encryptedContentCounts, targetProvider) {
@@ -530,18 +548,33 @@ export async function runExportHistory({
   codexHome: explicitCodexHome,
   archivePath,
   overwrite = false,
+  selectionKeys,
+  threadIds,
   onProgress
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
   const resolvedArchivePath = archivePath ? path.resolve(archivePath) : defaultHistoryArchivePath();
   await ensureCodexHome(codexHome);
+  let resolvedSelectionKeys = selectionKeys ?? null;
+  if (!resolvedSelectionKeys && threadIds?.length) {
+    const preview = await buildExportPreview(codexHome);
+    const requestedIds = new Set(threadIds);
+    const matched = preview.filter((entry) => entry.threadId && requestedIds.has(entry.threadId));
+    const matchedIds = new Set(matched.map((entry) => entry.threadId));
+    const missingIds = [...requestedIds].filter((threadId) => !matchedIds.has(threadId));
+    if (missingIds.length > 0) {
+      throw new Error(`No exportable conversation found for thread id(s): ${missingIds.join(", ")}`);
+    }
+    resolvedSelectionKeys = matched.map((entry) => entry.key);
+  }
   const releaseLock = await acquireLock(codexHome, "export-history");
   try {
     emitProgress(onProgress, { stage: "create_history_archive", status: "start" });
     const result = await createHistoryArchive({
       codexHome,
       archivePath: resolvedArchivePath,
-      overwrite
+      overwrite,
+      selectionKeys: resolvedSelectionKeys
     });
     emitProgress(onProgress, { stage: "create_history_archive", status: "complete", archivePath: result.archivePath });
     return {
@@ -551,6 +584,15 @@ export async function runExportHistory({
   } finally {
     await releaseLock();
   }
+}
+
+export async function getExportHistoryPreview({ codexHome: explicitCodexHome } = {}) {
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  return {
+    codexHome,
+    conversations: await buildExportPreview(codexHome)
+  };
 }
 
 async function syncProviderMetadataAfterImport({

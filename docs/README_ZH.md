@@ -50,6 +50,8 @@ codex-provider sync
 codex-provider sync --provider openai
 codex-provider switch apigather
 codex-provider export
+codex-provider export --select
+codex-provider export selected-history.tgz --ids thread-a,thread-b
 codex-provider import codex-history.tgz
 codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\<timestamp>
 codex-provider prune-backups --keep 5
@@ -60,7 +62,7 @@ codex-provider prune-backups --keep 5
 - `status`：只检查当前 provider、rollout、SQLite、项目可见性诊断。
 - `sync`：不切换登录状态，只把历史会话 metadata 同步到当前 provider。
 - `switch <provider-id>`：修改 `config.toml` 根级 `model_provider`，然后执行同步。
-- `export <archive-path>`：导出 `sessions`、`archived_sessions` 和检测到的 SQLite 会话 metadata，便于迁移到另一台设备。
+- `export [archive-path]`：导出 `sessions`、`archived_sessions` 和检测到的 SQLite 会话 metadata，便于迁移到另一台设备；支持 `--select` 预览选择和 `--ids` 指定 thread id。
 - `import <archive-path>`：导入导出的历史包，默认把导入记录对齐到目标设备当前 provider。
 - `restore <backup-dir>`：从备份恢复，支持 `--no-config`、`--no-db`、`--no-sessions`。
 - `prune-backups --keep <n>`：只清理本工具创建的旧备份。
@@ -77,6 +79,20 @@ codex-provider export
 
 ```bash
 codex-provider export codex-history.tgz
+```
+
+如果只想迁移部分对话，可以先预览再手动选择：
+
+```bash
+codex-provider export --select
+```
+
+交互里会按列表展示 thread id、active/archived、provider、时间、首条用户消息预览、cwd 和 rollout 路径。直接输入文字可搜索，`↑/↓` 浏览，`Space` 选择/取消，`←/→` 或 `PageUp/PageDown` 翻页，`Enter` 导出，`Esc` 退出。
+
+自动化场景可以直接指定 thread id：
+
+```bash
+codex-provider export selected-history.tgz --ids thread-a,thread-b
 ```
 
 把 `codex-history.tgz` 复制到目标设备后导入：
@@ -96,6 +112,7 @@ codex-provider import codex-history.tgz --dry-run
 导入说明：
 
 - 默认导入到目标设备当前 `model_provider`，也可以用 `--provider <id>` 指定。
+- 如果导出时只选择了部分对话，导入时也只会增量合并这些记录。
 - 如果发现同一个 thread id 已存在，交互式终端默认会展示本地/导入记录并让你选择保留哪一个。
 - 非交互环境遇到冲突时需要显式传 `--conflict skip`、`--conflict overwrite` 或 `--conflict fail`。
 - 导入前会创建 managed backup，并继续使用 `--keep <n>` 控制备份保留数量。

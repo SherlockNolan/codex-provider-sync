@@ -19,7 +19,7 @@ Usage:
   codex-provider status [--codex-home PATH]
   codex-provider sync [--provider ID] [--keep N] [--codex-home PATH]
   codex-provider switch <provider-id> [--keep N] [--codex-home PATH]
-  codex-provider export [archive-path] [--overwrite] [--codex-home PATH]
+  codex-provider export [archive-path] [--select] [--ids ID[,ID...]] [--overwrite] [--codex-home PATH]
   codex-provider import <archive-path> [--provider ID] [--conflict ask|skip|overwrite|fail] [--dry-run] [--keep N] [--codex-home PATH]
   codex-provider prune-backups [--keep N] [--codex-home PATH]
   codex-provider restore <backup-dir> [--no-config] [--no-db] [--no-sessions] [--codex-home PATH]
@@ -109,6 +109,7 @@ function summarizeExport(result) {
     `Rollout files: ${result.rolloutFiles}`,
     `SQLite files: ${result.dbFiles}`,
     `Global state files: ${result.globalStateFiles}`,
+    `Selected export: ${result.selected ? "yes" : "no"}`,
     `Archive size: ${formatBytes(result.bytes)}`
   ].join("\n");
 }
@@ -301,6 +302,429 @@ function askQuestion(rl, prompt) {
   });
 }
 
+function stripControlCharacters(value) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ");
+}
+
+function stripAnsi(value) {
+  return String(value ?? "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
+function isCombiningCodePoint(codePoint) {
+  return (codePoint >= 0x0300 && codePoint <= 0x036f)
+    || (codePoint >= 0x1ab0 && codePoint <= 0x1aff)
+    || (codePoint >= 0x1dc0 && codePoint <= 0x1dff)
+    || (codePoint >= 0x20d0 && codePoint <= 0x20ff)
+    || (codePoint >= 0xfe20 && codePoint <= 0xfe2f);
+}
+
+function isWideCodePoint(codePoint) {
+  return (codePoint >= 0x1100 && (
+    codePoint <= 0x115f
+    || codePoint === 0x2329
+    || codePoint === 0x232a
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  ));
+}
+
+function stringDisplayWidth(value) {
+  let width = 0;
+  for (const char of Array.from(stripAnsi(value))) {
+    const codePoint = char.codePointAt(0);
+    if (!codePoint || isCombiningCodePoint(codePoint)) {
+      continue;
+    }
+    width += isWideCodePoint(codePoint) ? 2 : 1;
+  }
+  return width;
+}
+
+function truncateText(value, maxLength) {
+  const normalized = stripControlCharacters(value).replace(/\s+/g, " ").trim();
+  if (maxLength <= 0) {
+    return "";
+  }
+  if (stringDisplayWidth(normalized) <= maxLength) {
+    return normalized;
+  }
+  if (maxLength <= 3) {
+    let shortText = "";
+    let width = 0;
+    for (const char of Array.from(normalized)) {
+      const nextWidth = stringDisplayWidth(char);
+      if (width + nextWidth > maxLength) {
+        break;
+      }
+      shortText += char;
+      width += nextWidth;
+    }
+    return shortText;
+  }
+  let text = "";
+  let width = 0;
+  const targetWidth = maxLength - 3;
+  for (const char of Array.from(normalized)) {
+    const nextWidth = stringDisplayWidth(char);
+    if (width + nextWidth > targetWidth) {
+      break;
+    }
+    text += char;
+    width += nextWidth;
+  }
+  return `${text}...`;
+}
+
+function visibleLength(value) {
+  return stringDisplayWidth(value);
+}
+
+function padVisible(value, width) {
+  const text = String(value ?? "");
+  const length = visibleLength(text);
+  if (length >= width) {
+    return text;
+  }
+  return `${text}${" ".repeat(width - length)}`;
+}
+
+const THEME = {
+  reset: "\x1b[0m",
+  dim: "\x1b[90m",
+  text: "\x1b[37m",
+  muted: "\x1b[38;5;245m",
+  panel: "\x1b[48;5;236m",
+  panelAlt: "\x1b[48;5;237m",
+  active: "\x1b[48;5;240m",
+  accent: "\x1b[38;5;171m",
+  selected: "\x1b[38;5;120m",
+  warning: "\x1b[38;5;214m",
+  header: "\x1b[38;5;250m",
+  rule: "\x1b[38;5;242m"
+};
+
+function searchableExportText(entry) {
+  return [
+    entry.threadId,
+    entry.scope,
+    entry.provider,
+    entry.cwd,
+    entry.timestamp,
+    entry.firstUserMessage,
+    entry.relativePath
+  ].filter(Boolean).join("\n").toLowerCase();
+}
+
+function filterExportPreviewEntries(conversations, query) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return conversations;
+  }
+  return conversations.filter((entry) => searchableExportText(entry).includes(normalizedQuery));
+}
+
+function buildExportBrowserLayout() {
+  const width = Math.max(50, process.stdout.columns ?? 100);
+  const height = Math.max(12, process.stdout.rows ?? 30);
+  const headerRows = 4;
+  const footerRows = 3;
+  const bodyRows = Math.max(3, height - headerRows - footerRows);
+  const gutterWidth = 2;
+  const checkWidth = 3;
+  const indexWidth = width >= 72 ? 4 : 0;
+  const scopeWidth = width >= 66 ? 5 : 0;
+  const providerWidth = width >= 78 ? 13 : (width >= 62 ? 9 : 0);
+  const timeWidth = width >= 86 ? 20 : (width >= 70 ? 12 : 0);
+  const nonTitleWidths = [
+    gutterWidth,
+    checkWidth,
+    indexWidth,
+    scopeWidth,
+    providerWidth,
+    timeWidth
+  ].filter((columnWidth) => columnWidth > 0);
+  const separatorWidth = nonTitleWidths.length;
+  const fixedWidth = nonTitleWidths.reduce((total, columnWidth) => total + columnWidth, 0) + separatorWidth;
+  const titleWidth = Math.max(8, width - fixedWidth);
+  return {
+    width,
+    height,
+    headerRows,
+    footerRows,
+    bodyRows,
+    gutterWidth,
+    checkWidth,
+    indexWidth,
+    scopeWidth,
+    providerWidth,
+    timeWidth,
+    titleWidth
+  };
+}
+
+function formatCell(value, width) {
+  return width > 0 ? padVisible(truncateText(value, width), width) : "";
+}
+
+function joinRowCells(cells) {
+  return cells.filter((cell) => cell !== "").join(" ");
+}
+
+function colorRow(line, { active, selected, odd }) {
+  const background = active ? THEME.active : (odd ? THEME.panelAlt : THEME.panel);
+  const foreground = active
+    ? THEME.text
+    : (selected ? THEME.selected : THEME.muted);
+  return `${background}${foreground}${line}${THEME.reset}`;
+}
+
+function formatExportBrowserRow(entry, { selected, active, odd, layout }) {
+  const marker = selected ? "●" : "○";
+  const pointer = active ? "›" : " ";
+  const ageOrTime = entry.timestamp ? truncateText(entry.timestamp, layout.timeWidth) : "";
+  const title = entry.firstUserMessage || entry.threadId || entry.relativePath;
+  const plainLine = joinRowCells([
+    padVisible(pointer, layout.gutterWidth),
+    padVisible(marker, layout.checkWidth),
+    layout.indexWidth ? formatCell(String(entry.index), layout.indexWidth) : "",
+    layout.scopeWidth ? formatCell(entry.scope === "archived_sessions" ? "arch" : "live", layout.scopeWidth) : "",
+    layout.providerWidth ? formatCell(entry.provider, layout.providerWidth) : "",
+    layout.timeWidth ? formatCell(ageOrTime, layout.timeWidth) : "",
+    formatCell(title, layout.titleWidth)
+  ]);
+  return colorRow(padVisible(plainLine, layout.width), { active, selected, odd });
+}
+
+function formatExportBrowserHeader(layout) {
+  const line = joinRowCells([
+    "".padEnd(layout.gutterWidth, " "),
+    "".padEnd(layout.checkWidth, " "),
+    layout.indexWidth ? formatCell("#", layout.indexWidth) : "",
+    layout.scopeWidth ? formatCell("Box", layout.scopeWidth) : "",
+    layout.providerWidth ? formatCell("Provider", layout.providerWidth) : "",
+    layout.timeWidth ? formatCell("Updated", layout.timeWidth) : "",
+    formatCell("Conversation", layout.titleWidth)
+  ]);
+  return `${THEME.header}${padVisible(line, layout.width)}${THEME.reset}`;
+}
+
+function formatRule(width) {
+  return `${THEME.rule}${"─".repeat(width)}${THEME.reset}`;
+}
+
+function renderExportBrowser({
+  preview,
+  filtered,
+  selectedKeys,
+  cursor,
+  scroll,
+  query,
+  message
+}) {
+  const layout = buildExportBrowserLayout();
+  const visible = filtered.slice(scroll, scroll + layout.bodyRows);
+  const page = filtered.length === 0 ? 0 : Math.floor(scroll / layout.bodyRows) + 1;
+  const pageCount = filtered.length === 0 ? 0 : Math.ceil(filtered.length / layout.bodyRows);
+  const queryText = query ? `${THEME.accent}${truncateText(query, Math.max(1, layout.width - 18))}${THEME.reset}` : `${THEME.dim}(empty)${THEME.reset}`;
+  const countText = `${THEME.muted}Filtered ${filtered.length}/${preview.conversations.length}  Selected ${selectedKeys.size}  Page ${page}/${pageCount}${THEME.reset}`;
+  const topLine = `${THEME.header}Type to search:${THEME.reset} ${queryText}`;
+  const lines = [
+    padVisible(topLine, layout.width),
+    padVisible(countText, layout.width),
+    formatExportBrowserHeader(layout),
+    formatRule(layout.width)
+  ];
+
+  for (let offset = 0; offset < layout.bodyRows; offset += 1) {
+    const entry = visible[offset];
+    if (!entry) {
+      const blank = " ".repeat(layout.width);
+      lines.push(`${offset % 2 ? THEME.panelAlt : THEME.panel}${blank}${THEME.reset}`);
+      continue;
+    }
+    const active = scroll + offset === cursor;
+    lines.push(formatExportBrowserRow(entry, {
+      selected: selectedKeys.has(entry.key),
+      active,
+      odd: offset % 2 === 1,
+      layout
+    }));
+  }
+
+  const footer = "↑/↓ browse  ←/→ PgUp/PgDn page  Space select  Ctrl+A all  Ctrl+N none  Enter export  Esc exit";
+  lines.push(formatRule(layout.width));
+  lines.push(`${message ? THEME.warning : THEME.dim}${padVisible(truncateText(message || footer, layout.width), layout.width)}${THEME.reset}`);
+  lines.push(`${THEME.dim}${padVisible(truncateText(preview.codexHome, layout.width), layout.width)}${THEME.reset}`);
+  return `\x1b[?25l\x1b[H${lines.slice(0, layout.height).join("\n")}`;
+}
+
+async function chooseExportSelection(preview) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("Interactive export selection requires a terminal. Use --ids <thread-id[,thread-id]> for non-interactive exports.");
+  }
+  if (preview.conversations.length === 0) {
+    throw new Error("No exportable Codex conversations found.");
+  }
+
+  readline.emitKeypressEvents(process.stdin);
+  const previousRawMode = process.stdin.isRaw;
+  const selectedKeys = new Set();
+  let query = "";
+  let cursor = 0;
+  let scroll = 0;
+  let message = "";
+
+  function filteredEntries() {
+    return filterExportPreviewEntries(preview.conversations, query);
+  }
+
+  function bodyHeight() {
+    return buildExportBrowserLayout().bodyRows;
+  }
+
+  function clampView(filtered) {
+    if (filtered.length === 0) {
+      cursor = 0;
+      scroll = 0;
+      return;
+    }
+    cursor = Math.max(0, Math.min(cursor, filtered.length - 1));
+    const pageSize = bodyHeight();
+    if (cursor < scroll) {
+      scroll = cursor;
+    } else if (cursor >= scroll + pageSize) {
+      scroll = cursor - pageSize + 1;
+    }
+    scroll = Math.max(0, Math.min(scroll, Math.max(0, filtered.length - pageSize)));
+  }
+
+  function render() {
+    const filtered = filteredEntries();
+    clampView(filtered);
+    process.stdout.write(renderExportBrowser({
+      preview,
+      filtered,
+      selectedKeys,
+      cursor,
+      scroll,
+      query,
+      message
+    }));
+    message = "";
+  }
+
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+  render();
+
+  return await new Promise((resolve, reject) => {
+    let finished = false;
+    function finish(error, value) {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      process.stdin.off("keypress", onKeyPress);
+      process.stdout.off("resize", render);
+      process.stdin.setRawMode(Boolean(previousRawMode));
+      process.stdout.write("\x1b[?25h\x1b[?1049l");
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(value);
+    }
+
+    function move(delta) {
+      const filtered = filteredEntries();
+      if (filtered.length === 0) {
+        return;
+      }
+      cursor = Math.max(0, Math.min(cursor + delta, filtered.length - 1));
+    }
+
+    function page(delta) {
+      move(delta * bodyHeight());
+    }
+
+    function onKeyPress(str, key = {}) {
+      if (key.ctrl && key.name === "c") {
+        finish(new Error("History export aborted by user."));
+        return;
+      }
+      if (key.name === "escape") {
+        finish(new Error("History export aborted by user."));
+        return;
+      }
+      if (key.ctrl && key.name === "a") {
+        for (const entry of filteredEntries()) {
+          selectedKeys.add(entry.key);
+        }
+        render();
+        return;
+      }
+      if (key.ctrl && key.name === "n") {
+        selectedKeys.clear();
+        render();
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        if (selectedKeys.size === 0) {
+          message = "Select at least one conversation before exporting.";
+          render();
+          return;
+        }
+        finish(null, preview.conversations
+          .filter((entry) => selectedKeys.has(entry.key))
+          .map((entry) => entry.key));
+        return;
+      }
+      if (key.name === "up") {
+        move(-1);
+      } else if (key.name === "down") {
+        move(1);
+      } else if (key.name === "left" || key.name === "pageup") {
+        page(-1);
+      } else if (key.name === "right" || key.name === "pagedown") {
+        page(1);
+      } else if (key.name === "home") {
+        cursor = 0;
+      } else if (key.name === "end") {
+        cursor = Math.max(0, filteredEntries().length - 1);
+      } else if (key.name === "space") {
+        const entry = filteredEntries()[cursor];
+        if (entry) {
+          if (selectedKeys.has(entry.key)) {
+            selectedKeys.delete(entry.key);
+          } else {
+            selectedKeys.add(entry.key);
+          }
+        }
+      } else if (key.name === "backspace") {
+        query = query.slice(0, -1);
+        cursor = 0;
+        scroll = 0;
+      } else if (!key.ctrl && !key.meta && str && str >= " " && str !== "\u007f") {
+        query += str;
+        cursor = 0;
+        scroll = 0;
+      }
+      render();
+    }
+
+    process.stdin.on("keypress", onKeyPress);
+    process.stdout.on("resize", render);
+  });
+}
+
 function createConflictResolver() {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     return null;
@@ -409,11 +833,19 @@ async function main() {
   }
 
   if (command === "export") {
-    const { runExportHistory } = await loadService();
+    const { getExportHistoryPreview, parseExportThreadIds, runExportHistory } = await loadService();
     const archivePath = positionals[1] ?? flags.output;
+    if (flags.select && flags.ids) {
+      throw new Error("Use either --select or --ids, not both.");
+    }
+    const selectionKeys = flags.select
+      ? await chooseExportSelection(await getExportHistoryPreview({ codexHome: flags["codex-home"] }))
+      : null;
     const result = await runExportHistory({
       codexHome: flags["codex-home"],
       archivePath,
+      selectionKeys,
+      threadIds: parseExportThreadIds(flags.ids),
       overwrite: Boolean(flags.overwrite),
       onProgress: createProgressReporter(EXPORT_PROGRESS_STAGES)
     });

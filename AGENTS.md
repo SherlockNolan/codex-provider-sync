@@ -64,6 +64,8 @@ Use `codex-provider export <archive-path>` when:
 
 - the user wants to move Codex conversation history to another device
 - the user asks for a portable backup/archive of sessions and SQLite thread metadata
+- use `codex-provider export --select` when the user wants to preview and choose specific conversations
+- use `codex-provider export <archive-path> --ids <id[,id]>` for automated partial exports
 
 Use `codex-provider import <archive-path>` when:
 
@@ -144,6 +146,8 @@ codex-provider sync --keep 5
 codex-provider sync --provider openai
 codex-provider switch apigather
 codex-provider export codex-history.tgz
+codex-provider export --select
+codex-provider export selected-history.tgz --ids thread-a,thread-b
 codex-provider import codex-history.tgz
 codex-provider import codex-history.tgz --provider openai --conflict ask
 codex-provider prune-backups --keep 5

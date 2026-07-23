@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  getExportHistoryPreview,
   runExportHistory,
   runImportHistory
 } from "../src/service.js";
@@ -162,6 +163,54 @@ test("cli export defaults to a dated archive in the current terminal directory",
     .filter((name) => /^codex-history_\d{8}_\d{6}\.tgz$/.test(name));
   assert.equal(archiveNames.length, 1);
   await fs.access(path.join(root, archiveNames[0]));
+});
+
+test("selected export includes only chosen conversations and merges them incrementally", async () => {
+  const { root, codexHome: sourceHome } = await makeTempCodexHome();
+  await writeConfig(sourceHome, 'model_provider = "openai"');
+  await writeRollout(sourceHome, "sessions", "19", "thread-a", "openai", "source a");
+  await writeRollout(sourceHome, "sessions", "20", "thread-b", "openai", "source b");
+  await writeRollout(sourceHome, "archived_sessions", "21", "thread-c", "openai", "source c");
+  await writeStateDb(sourceHome, [
+    { id: "thread-a", model_provider: "openai", first_user_message: "source sqlite a" },
+    { id: "thread-b", model_provider: "openai", first_user_message: "source sqlite b" },
+    { id: "thread-c", model_provider: "openai", archived: true, first_user_message: "source sqlite c" }
+  ]);
+
+  const preview = await getExportHistoryPreview({ codexHome: sourceHome });
+  assert.equal(preview.conversations.length, 3);
+  const archivePath = path.join(root, "selected.tgz");
+  const exportResult = await runExportHistory({
+    codexHome: sourceHome,
+    archivePath,
+    threadIds: ["thread-b"]
+  });
+  assert.equal(exportResult.selected, true);
+  assert.equal(exportResult.rolloutFiles, 1);
+
+  const { codexHome: targetHome } = await makeTempCodexHome();
+  await writeConfig(targetHome, 'model_provider = "openai"');
+  await writeRollout(targetHome, "sessions", "18", "thread-local", "openai", "local");
+  await writeStateDb(targetHome, [
+    { id: "thread-local", model_provider: "openai", first_user_message: "local sqlite" }
+  ]);
+
+  const importResult = await runImportHistory({
+    codexHome: targetHome,
+    archivePath,
+    conflict: "fail"
+  });
+
+  assert.equal(importResult.plan.archiveRolloutFiles, 1);
+  assert.equal(importResult.plan.archiveSqliteRows, 1);
+  assert.equal(importResult.sqliteRowsInserted, 1);
+  assert.deepEqual(await readThreadRows(targetHome), [
+    { id: "thread-b", model_provider: "openai", archived: 0, first_user_message: "source sqlite b" },
+    { id: "thread-local", model_provider: "openai", archived: 0, first_user_message: "local sqlite" }
+  ]);
+  await fs.access(path.join(targetHome, "sessions", "2026", "03", "20", "rollout-thread-b.jsonl"));
+  await assert.rejects(fs.access(path.join(targetHome, "sessions", "2026", "03", "19", "rollout-thread-a.jsonl")));
+  await assert.rejects(fs.access(path.join(targetHome, "archived_sessions", "2026", "03", "21", "rollout-thread-c.jsonl")));
 });
 
 test("runImportHistory imports into a Codex home without SQLite and rewrites provider to current provider", async () => {
