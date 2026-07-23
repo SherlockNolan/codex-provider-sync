@@ -27,5 +27,8 @@
   "license": "MIT",
   "optionalDependencies": {
     "better-sqlite3": "8.7.0"
+  },
+  "dependencies": {
+    "tar": "^6.2.1"
   }
 }

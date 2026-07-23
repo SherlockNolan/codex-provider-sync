@@ -115,6 +115,32 @@ Clean old managed backups manually:
 codex-provider prune-backups --keep 5
 ```
 
+Export history from one device:
+
+```bash
+codex-provider export
+```
+
+Without an explicit path, export writes `codex-history_YYYYMMDD_HHMMSS.tgz` in the current terminal directory. You can still choose a file name explicitly:
+
+```bash
+codex-provider export codex-history.tgz
+```
+
+Import that archive on another device:
+
+```bash
+codex-provider import codex-history.tgz
+```
+
+Common import options:
+
+```bash
+codex-provider import codex-history.tgz --provider openai --conflict ask
+codex-provider import codex-history.tgz --conflict skip
+codex-provider import codex-history.tgz --dry-run
+```
+
 ## AI Quick Run
 
 If you want an AI assistant to handle this in one shot, copy this prompt:
@@ -161,6 +187,16 @@ Quick mapping:
   - updates root `model_provider` in `config.toml`
   - immediately runs a sync
   - `--keep <n>` overrides how many managed backups are retained after the run
+- `codex-provider export [archive-path]`
+  - exports `sessions`, `archived_sessions`, and detected SQLite thread metadata to a `.tgz` archive
+  - defaults to `codex-history_YYYYMMDD_HHMMSS.tgz` in the current terminal directory
+  - use `--overwrite` to replace an existing archive file
+- `codex-provider import <archive-path>`
+  - imports a history archive on another device
+  - defaults imported records to the destination current provider
+  - `--provider <id>` overrides the import provider
+  - `--conflict ask|skip|overwrite|fail` controls same-thread conflicts
+  - `--dry-run` reports the plan without writing
 - `codex-provider prune-backups`
   - manually removes older managed backups and keeps the newest `n`
 - `codex-provider restore <backup-dir>`
@@ -180,6 +216,9 @@ codex-provider sync --keep 5
 codex-provider sync --provider openai
 codex-provider switch openai
 codex-provider switch apigather
+codex-provider export
+codex-provider import codex-history.tgz
+codex-provider import codex-history.tgz --provider openai --conflict ask
 codex-provider prune-backups --keep 5
 codex-provider install-windows-launcher
 codex-provider install-windows-launcher --dir D:\Tools
@@ -193,7 +232,7 @@ codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\20260319T
 
 ## Safety
 
-Before each sync, the tool creates a backup under:
+Before each sync/import, the tool creates a backup under:
 
 ```text
 ~/.codex/backups_state/provider-sync/<timestamp>
@@ -207,6 +246,8 @@ It also uses:
 
 - It does not replace official `codex`.
 - It does not manage `auth.json` or third-party login tools.
+- History archives do not include `auth.json`, `config.toml`, logs, caches, or old backups.
+- Import does not log you in or configure providers on the new device.
 - It does not rewrite message history, titles, cwd, or timestamps.
 - It keeps the newest 5 managed backups by default; GUI retention settings or CLI `--keep <n>` can override that.
 - Manual cleanup and auto-prune only touch backups created by this tool inside `backups_state/provider-sync`.

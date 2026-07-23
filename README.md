@@ -51,6 +51,8 @@ codex-provider status
 codex-provider sync
 codex-provider sync --provider openai
 codex-provider switch apigather
+codex-provider export
+codex-provider import codex-history.tgz
 codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\<timestamp>
 codex-provider prune-backups --keep 5
 ```
@@ -60,14 +62,53 @@ codex-provider prune-backups --keep 5
 - `status`：只检查当前 provider、rollout、SQLite、项目可见性诊断。
 - `sync`：不切换登录状态，只把历史会话 metadata 同步到当前 provider。
 - `switch <provider-id>`：修改 `config.toml` 根级 `model_provider`，然后执行同步。
+- `export <archive-path>`：导出 `sessions`、`archived_sessions` 和检测到的 SQLite 会话 metadata，便于迁移到另一台设备。
+- `import <archive-path>`：导入导出的历史包，默认把导入记录对齐到目标设备当前 provider。
 - `restore <backup-dir>`：从备份恢复，支持 `--no-config`、`--no-db`、`--no-sessions`。
 - `prune-backups --keep <n>`：只清理本工具创建的旧备份。
+
+## 对话记录迁移
+
+在源设备导出：
+
+```bash
+codex-provider export
+```
+
+不传路径时会在当前 terminal 所在目录生成 `codex-history_YYYYMMDD_HHMMSS.tgz`。也可以显式指定文件名：
+
+```bash
+codex-provider export codex-history.tgz
+```
+
+把 `codex-history.tgz` 复制到目标设备后导入：
+
+```bash
+codex-provider import codex-history.tgz
+```
+
+常用选项：
+
+```bash
+codex-provider import codex-history.tgz --provider openai --conflict ask
+codex-provider import codex-history.tgz --conflict skip
+codex-provider import codex-history.tgz --dry-run
+```
+
+导入说明：
+
+- 默认导入到目标设备当前 `model_provider`，也可以用 `--provider <id>` 指定。
+- 如果发现同一个 thread id 已存在，交互式终端默认会展示本地/导入记录并让你选择保留哪一个。
+- 非交互环境遇到冲突时需要显式传 `--conflict skip`、`--conflict overwrite` 或 `--conflict fail`。
+- 导入前会创建 managed backup，并继续使用 `--keep <n>` 控制备份保留数量。
+- 迁移包不包含 `auth.json`、`config.toml`、日志、缓存或旧备份。
 
 ## 能力边界
 
 本工具只修复“历史会话可见性”相关 metadata，不修改会话内容。
 
 - 不处理登录、认证、`auth.json` 或第三方切号工具。
+- 不导入/导出登录状态或 provider 配置；新设备仍需自己完成登录和配置。
 - 不修改消息历史、会话标题、对话内容。
 - 不修改 `updated_at`，不通过改变历史排序来修复 Desktop 显示。
 - 不把旧会话里的 `encrypted_content` 重新加密到另一个 provider / account。

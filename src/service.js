@@ -43,6 +43,16 @@ import {
   readThreadCwdStats,
   syncWorkspaceRoots
 } from "./workspace-roots.js";
+import {
+  buildImportPlan,
+  cleanupExtractedHistory,
+  copyImportedRollouts,
+  createHistoryArchive,
+  extractHistoryArchive,
+  mergeImportedSqliteThreads,
+  resolveImportConflicts,
+  summarizeImportPlan
+} from "./history-transfer.js";
 
 function normalizeCodexHome(explicitCodexHome) {
   return path.resolve(explicitCodexHome ?? process.env.CODEX_HOME ?? defaultCodexHome());
@@ -50,6 +60,17 @@ function normalizeCodexHome(explicitCodexHome) {
 
 async function ensureCodexHome(codexHome) {
   await fs.access(codexHome);
+}
+
+async function readConfigTextOrEmpty(configPath) {
+  try {
+    return await readConfigText(configPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return "";
+    }
+    throw error;
+  }
 }
 
 function formatCounts(counts) {
@@ -77,6 +98,23 @@ function emitProgress(onProgress, event) {
 
 function sumCounts(counts) {
   return Object.values(counts ?? {}).reduce((total, value) => total + value, 0);
+}
+
+function formatLocalTimestampForFileName(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "_",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join("");
+}
+
+export function defaultHistoryArchivePath(date = new Date()) {
+  return path.resolve(process.cwd(), `codex-history_${formatLocalTimestampForFileName(date)}.tgz`);
 }
 
 function buildEncryptedContentWarning(encryptedContentCounts, targetProvider) {
@@ -484,6 +522,251 @@ export async function runPruneBackups({
   try {
     return await pruneBackups(codexHome, keepCount);
   } finally {
+    await releaseLock();
+  }
+}
+
+export async function runExportHistory({
+  codexHome: explicitCodexHome,
+  archivePath,
+  overwrite = false,
+  onProgress
+} = {}) {
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  const resolvedArchivePath = archivePath ? path.resolve(archivePath) : defaultHistoryArchivePath();
+  await ensureCodexHome(codexHome);
+  const releaseLock = await acquireLock(codexHome, "export-history");
+  try {
+    emitProgress(onProgress, { stage: "create_history_archive", status: "start" });
+    const result = await createHistoryArchive({
+      codexHome,
+      archivePath: resolvedArchivePath,
+      overwrite
+    });
+    emitProgress(onProgress, { stage: "create_history_archive", status: "complete", archivePath: result.archivePath });
+    return {
+      codexHome,
+      ...result
+    };
+  } finally {
+    await releaseLock();
+  }
+}
+
+async function syncProviderMetadataAfterImport({
+  codexHome,
+  targetProvider,
+  backupDir,
+  sqliteBusyTimeoutMs,
+  onProgress
+}) {
+  emitProgress(onProgress, { stage: "scan_imported_history", status: "start" });
+  const {
+    changes,
+    lockedPaths: lockedReadPaths,
+    userEventThreadIds,
+    threadCwdById
+  } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
+  emitProgress(onProgress, {
+    stage: "scan_imported_history",
+    status: "complete",
+    scannedChanges: changes.length,
+    lockedReadCount: lockedReadPaths.length
+  });
+
+  const cwdStats = await readThreadCwdStats(codexHome);
+  const { writableChanges, lockedChanges } = await splitLockedSessionChanges(changes);
+  let applyResult = { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
+  let workspaceRootResult = {
+    updated: false,
+    updatedWorkspaceRoots: 0,
+    savedWorkspaceRootCount: 0
+  };
+
+  emitProgress(onProgress, { stage: "sync_imported_metadata", status: "start" });
+  const sqliteResult = await updateSqliteProvider(
+    codexHome,
+    targetProvider,
+    async () => {
+      if (writableChanges.length > 0) {
+        applyResult = await applySessionChanges(writableChanges);
+        const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
+        const appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
+        await updateSessionBackupManifest(backupDir, appliedSessionChanges);
+      }
+      workspaceRootResult = await syncWorkspaceRoots(codexHome, { cwdStats });
+    },
+    { busyTimeoutMs: sqliteBusyTimeoutMs, userEventThreadIds, threadCwdById }
+  );
+  emitProgress(onProgress, {
+    stage: "sync_imported_metadata",
+    status: "complete",
+    updatedRows: sqliteResult.updatedRows,
+    appliedChanges: applyResult.appliedChanges
+  });
+
+  return {
+    changedSessionFiles: applyResult.appliedChanges,
+    skippedLockedRolloutFiles: [...new Set([
+      ...lockedReadPaths,
+      ...lockedChanges.map((change) => change.path),
+      ...applyResult.skippedPaths
+    ])].sort((left, right) => left.localeCompare(right)),
+    sqliteRowsUpdated: sqliteResult.updatedRows,
+    sqliteProviderRowsUpdated: sqliteResult.providerRowsUpdated,
+    sqliteUserEventRowsUpdated: sqliteResult.userEventRowsUpdated,
+    sqliteCwdRowsUpdated: sqliteResult.cwdRowsUpdated,
+    updatedWorkspaceRoots: workspaceRootResult.updatedWorkspaceRoots,
+    savedWorkspaceRootCount: workspaceRootResult.savedWorkspaceRootCount,
+    sqlitePresent: sqliteResult.databasePresent
+  };
+}
+
+export async function runImportHistory({
+  codexHome: explicitCodexHome,
+  archivePath,
+  provider,
+  conflict = "ask",
+  dryRun = false,
+  keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
+  sqliteBusyTimeoutMs,
+  onConflict,
+  onProgress
+} = {}) {
+  if (!archivePath) {
+    throw new Error("Missing archive path. Usage: codex-provider import <archive-path>");
+  }
+  if (!Number.isInteger(keepCount) || keepCount < 1) {
+    throw new Error(`Invalid automatic keep count: ${keepCount}. Expected an integer greater than or equal to 1.`);
+  }
+
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const configPath = path.join(codexHome, "config.toml");
+  const configText = await readConfigTextOrEmpty(configPath);
+  const current = readCurrentProviderFromConfigText(configText);
+  const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
+  if (provider && !configDeclaresProvider(configText, provider)) {
+    throw new Error(`Provider "${provider}" is not available in config.toml. Configure it first or use one of: ${listConfiguredProviderIds(configText).join(", ")}`);
+  }
+
+  const releaseLock = await acquireLock(codexHome, "import-history");
+  let extracted = null;
+  try {
+    emitProgress(onProgress, { stage: "extract_history_archive", status: "start" });
+    extracted = await extractHistoryArchive(archivePath);
+    emitProgress(onProgress, { stage: "extract_history_archive", status: "complete" });
+
+    emitProgress(onProgress, { stage: "plan_history_import", status: "start" });
+    const plan = await buildImportPlan({ codexHome, extracted });
+    const planSummary = summarizeImportPlan(plan);
+    emitProgress(onProgress, { stage: "plan_history_import", status: "complete", ...planSummary });
+
+    const decisions = await resolveImportConflicts({ plan, conflict, onConflict });
+    if (dryRun) {
+      return {
+        codexHome,
+        archivePath: path.resolve(archivePath),
+        targetProvider,
+        dryRun: true,
+        backupDir: null,
+        plan: planSummary,
+        importedRolloutFiles: 0,
+        skippedRolloutFiles: plan.conflicts.filter((item) => decisions.get(item.key) === "skip").length,
+        sqliteRowsInserted: 0,
+        sqliteRowsUpdatedByImport: 0,
+        sqliteRowsSkipped: 0,
+        changedSessionFiles: 0,
+        skippedLockedRolloutFiles: [],
+        sqliteRowsUpdated: 0,
+        sqlitePresent: Boolean(plan.localThreads.dbPath)
+      };
+    }
+
+    emitProgress(onProgress, { stage: "check_import_targets", status: "start" });
+    await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
+    emitProgress(onProgress, { stage: "check_import_targets", status: "complete" });
+
+    emitProgress(onProgress, { stage: "create_backup", status: "start" });
+    const backupStartedAt = Date.now();
+    const backupDir = await createBackup({
+      codexHome,
+      targetProvider,
+      sessionChanges: [],
+      configPath
+    });
+    const backupDurationMs = Date.now() - backupStartedAt;
+    emitProgress(onProgress, {
+      stage: "create_backup",
+      status: "complete",
+      backupDir,
+      durationMs: backupDurationMs
+    });
+
+    emitProgress(onProgress, { stage: "copy_history_rollouts", status: "start" });
+    const rolloutResult = await copyImportedRollouts({ codexHome, extracted, plan, decisions });
+    emitProgress(onProgress, { stage: "copy_history_rollouts", status: "complete", copied: rolloutResult.copied });
+
+    emitProgress(onProgress, { stage: "merge_history_sqlite", status: "start" });
+    const sqliteMergeResult = await mergeImportedSqliteThreads({
+      codexHome,
+      extracted,
+      plan,
+      decisions,
+      targetProvider
+    });
+    emitProgress(onProgress, {
+      stage: "merge_history_sqlite",
+      status: "complete",
+      insertedRows: sqliteMergeResult.insertedRows,
+      updatedRows: sqliteMergeResult.updatedRows
+    });
+
+    const syncResult = await syncProviderMetadataAfterImport({
+      codexHome,
+      targetProvider,
+      backupDir,
+      sqliteBusyTimeoutMs,
+      onProgress
+    });
+
+    let autoPruneResult = null;
+    let autoPruneWarning = null;
+    emitProgress(onProgress, { stage: "clean_backups", status: "start", keepCount });
+    try {
+      autoPruneResult = await pruneBackups(codexHome, keepCount);
+    } catch (pruneError) {
+      autoPruneWarning = `Automatic backup cleanup failed: ${pruneError instanceof Error ? pruneError.message : String(pruneError)}`;
+    }
+    emitProgress(onProgress, {
+      stage: "clean_backups",
+      status: "complete",
+      deletedCount: autoPruneResult?.deletedCount ?? 0,
+      warning: autoPruneWarning
+    });
+
+    return {
+      codexHome,
+      archivePath: path.resolve(archivePath),
+      targetProvider,
+      dryRun: false,
+      backupDir,
+      backupDurationMs,
+      plan: planSummary,
+      importedRolloutFiles: rolloutResult.copied,
+      skippedRolloutFiles: rolloutResult.skipped,
+      removedLocalConflictRolloutFiles: rolloutResult.removedLocalConflicts,
+      sqliteRowsInserted: sqliteMergeResult.insertedRows,
+      sqliteRowsUpdatedByImport: sqliteMergeResult.updatedRows,
+      sqliteRowsSkipped: sqliteMergeResult.skippedRows,
+      sqliteDatabaseCopied: sqliteMergeResult.databaseCopied,
+      copiedDbFiles: sqliteMergeResult.copiedDbFiles,
+      ...syncResult,
+      autoPruneResult,
+      autoPruneWarning
+    };
+  } finally {
+    await cleanupExtractedHistory(extracted);
     await releaseLock();
   }
 }

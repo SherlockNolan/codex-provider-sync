@@ -60,6 +60,18 @@ Use `codex-provider restore <backup-dir>` when:
 - the user wants to roll back a previous sync
 - the user synced to the wrong provider
 
+Use `codex-provider export <archive-path>` when:
+
+- the user wants to move Codex conversation history to another device
+- the user asks for a portable backup/archive of sessions and SQLite thread metadata
+
+Use `codex-provider import <archive-path>` when:
+
+- the user has an archive created by `codex-provider export`
+- the user wants to restore/migrate conversations onto this device
+- default to interactive conflict handling in a terminal, or pass
+  `--conflict skip|overwrite|fail` for automation
+
 Use `codex-provider status` only when:
 
 - the user asks for inspection only
@@ -131,6 +143,9 @@ codex-provider sync
 codex-provider sync --keep 5
 codex-provider sync --provider openai
 codex-provider switch apigather
+codex-provider export codex-history.tgz
+codex-provider import codex-history.tgz
+codex-provider import codex-history.tgz --provider openai --conflict ask
 codex-provider prune-backups --keep 5
 codex-provider restore C:\Users\you\.codex\backups_state\provider-sync\20260319T042708906Z
 ```
