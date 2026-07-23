@@ -87,7 +87,7 @@ codex-provider export codex-history.tgz
 codex-provider export --select
 ```
 
-交互里会按列表展示 thread id、active/archived、provider、时间、首条用户消息预览、cwd 和 rollout 路径。直接输入文字可搜索，`↑/↓` 浏览，`Space` 选择/取消，`←/→` 或 `PageUp/PageDown` 翻页，`Tab` 显示/隐藏 archived 条目，`Delete` 将当前条目在 active/archived 间切换，`Enter` 导出，`Esc` 退出。
+交互里会按列表展示 thread id、active/archived、provider、时间、rename 标题或首条用户消息预览、cwd 和 rollout 路径。直接输入文字可搜索，`↑/↓` 浏览，`Space` 选择/取消，`←/→` 或 `PageUp/PageDown` 翻页，`Ctrl+P` 原地展开预览，`Ctrl+T` 查看 transcript 详情，`Tab` 显示/隐藏 archived 条目，`Delete` 将当前条目在 active/archived 间切换，`Enter` 导出，`Esc` 退出。
 
 自动化场景可以直接指定 thread id：
 

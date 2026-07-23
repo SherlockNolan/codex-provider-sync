@@ -7,6 +7,7 @@ import path from "node:path";
 
 import {
   getExportHistoryPreview,
+  getExportHistoryTranscript,
   runExportHistory,
   runImportHistory,
   toggleExportHistoryArchived
@@ -212,6 +213,62 @@ test("selected export includes only chosen conversations and merges them increme
   await fs.access(path.join(targetHome, "sessions", "2026", "03", "20", "rollout-thread-b.jsonl"));
   await assert.rejects(fs.access(path.join(targetHome, "sessions", "2026", "03", "19", "rollout-thread-a.jsonl")));
   await assert.rejects(fs.access(path.join(targetHome, "archived_sessions", "2026", "03", "21", "rollout-thread-c.jsonl")));
+});
+
+test("export preview falls back to rollout title and first user message when SQLite preview is empty", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  await writeRollout(codexHome, "sessions", "19", "thread-title", "openai", "rollout first user");
+  await writeRollout(codexHome, "sessions", "20", "thread-message", "openai", "rollout fallback user");
+  const titlePath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-thread-title.jsonl");
+  const lines = (await fs.readFile(titlePath, "utf8")).trimEnd().split("\n");
+  const meta = JSON.parse(lines[0]);
+  meta.payload.title = "Renamed title";
+  lines[0] = JSON.stringify(meta);
+  await fs.writeFile(titlePath, `${lines.join("\n")}\n`, "utf8");
+  await writeStateDb(codexHome, [
+    { id: "thread-title", model_provider: "openai", first_user_message: "" },
+    { id: "thread-message", model_provider: "openai", first_user_message: "" }
+  ]);
+
+  const preview = await getExportHistoryPreview({ codexHome });
+  const titled = preview.conversations.find((entry) => entry.threadId === "thread-title");
+  const messageOnly = preview.conversations.find((entry) => entry.threadId === "thread-message");
+
+  assert.equal(titled.title, "Renamed title");
+  assert.equal(titled.firstUserMessage, "rollout first user");
+  assert.equal(messageOnly.title, "");
+  assert.equal(messageOnly.firstUserMessage, "rollout fallback user");
+});
+
+test("getExportHistoryTranscript reads user and assistant messages from rollout JSONL", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const rolloutPath = await writeRollout(codexHome, "sessions", "19", "thread-transcript", "openai", "hello from user");
+  await fs.appendFile(
+    rolloutPath,
+    JSON.stringify({
+      timestamp: "2026-03-19T00:00:01.000Z",
+      type: "event_msg",
+      payload: { type: "assistant_message", message: "hello from assistant" }
+    }) + "\n",
+    "utf8"
+  );
+  await writeStateDb(codexHome, [
+    { id: "thread-transcript", model_provider: "openai", first_user_message: "" }
+  ]);
+  const preview = await getExportHistoryPreview({ codexHome });
+  const entry = preview.conversations.find((candidate) => candidate.threadId === "thread-transcript");
+
+  const transcript = await getExportHistoryTranscript({ codexHome, entry });
+
+  assert.deepEqual(
+    transcript.messages.map((message) => [message.role, message.text]),
+    [
+      ["user", "hello from user"],
+      ["assistant", "hello from assistant"]
+    ]
+  );
 });
 
 test("toggleExportHistoryArchived moves rollout files and updates SQLite archived flag", async () => {

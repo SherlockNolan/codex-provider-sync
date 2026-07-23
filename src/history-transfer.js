@@ -1,6 +1,8 @@
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import readline from "node:readline";
 
 import * as tar from "tar";
 
@@ -20,6 +22,7 @@ import {
 
 const HISTORY_NAMESPACE = "provider-sync-history";
 const HISTORY_VERSION = 1;
+const DEFAULT_TRANSCRIPT_MESSAGE_LIMIT = 200;
 
 function toArchivePath(value) {
   return value.split(path.sep).join("/");
@@ -131,6 +134,129 @@ function parseSessionMeta(firstLine) {
     return parsed.payload;
   } catch {
     return null;
+  }
+}
+
+function textFromContent(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map(textFromContent)
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  for (const key of ["text", "input_text", "output_text", "message", "content"]) {
+    const text = textFromContent(value[key]);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function normalizeTranscriptRole(role) {
+  if (role === "assistant" || role === "user" || role === "system") {
+    return role;
+  }
+  return null;
+}
+
+function messageFromRecord(record) {
+  if (!record || typeof record !== "object") {
+    return null;
+  }
+
+  const payload = record.payload;
+  if (record.type === "event_msg" && payload && typeof payload === "object") {
+    if (payload.type === "user_message") {
+      const text = textFromContent(payload.message ?? payload.content ?? payload.text);
+      return text ? { role: "user", text } : null;
+    }
+    if (payload.type === "assistant_message" || payload.type === "agent_message") {
+      const text = textFromContent(payload.message ?? payload.content ?? payload.text);
+      return text ? { role: "assistant", text } : null;
+    }
+  }
+
+  for (const value of [record.payload, record.item, record.msg, record]) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const role = normalizeTranscriptRole(value.role);
+    if (value.type === "message" && role) {
+      const text = textFromContent(value.content ?? value.message ?? value.text);
+      if (text) {
+        return { role, text };
+      }
+    }
+  }
+  return null;
+}
+
+async function scanRolloutMessages(filePath, {
+  firstUserOnly = false,
+  limit = DEFAULT_TRANSCRIPT_MESSAGE_LIMIT
+} = {}) {
+  const messages = [];
+  let truncated = false;
+  const stream = createReadStream(filePath, {
+    encoding: "utf8",
+    highWaterMark: 1024 * 1024
+  });
+  const lines = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity
+  });
+
+  try {
+    for await (const line of lines) {
+      if (!line) {
+        continue;
+      }
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const message = messageFromRecord(record);
+      if (!message) {
+        continue;
+      }
+      if (firstUserOnly) {
+        if (message.role === "user") {
+          return { messages: [message], truncated: false };
+        }
+        continue;
+      }
+      if (messages.length >= limit) {
+        truncated = true;
+        break;
+      }
+      messages.push({
+        ...message,
+        timestamp: typeof record.timestamp === "string" ? record.timestamp : null
+      });
+    }
+    return { messages, truncated };
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+}
+
+async function readRolloutFirstUserMessage(filePath) {
+  try {
+    const { messages } = await scanRolloutMessages(filePath, { firstUserOnly: true, limit: 1 });
+    return messages[0]?.text ?? "";
+  } catch {
+    return "";
   }
 }
 
@@ -256,6 +382,7 @@ export async function collectRolloutInventory(codexHome) {
         relativePath,
         scope,
         threadId: typeof meta?.id === "string" && meta.id ? meta.id : null,
+        title: typeof meta?.title === "string" && meta.title ? meta.title : null,
         provider: typeof meta?.model_provider === "string" ? meta.model_provider : null,
         cwd: typeof meta?.cwd === "string" ? meta.cwd : null,
         timestamp: typeof meta?.timestamp === "string" ? meta.timestamp : null,
@@ -344,24 +471,50 @@ export async function buildExportPreview(codexHome) {
     String(right.timestamp ?? "").localeCompare(String(left.timestamp ?? ""))
     || left.relativePath.localeCompare(right.relativePath)
   ));
-  return sortedRollouts.map((rollout, index) => {
+  const conversations = [];
+  for (let index = 0; index < sortedRollouts.length; index += 1) {
+    const rollout = sortedRollouts[index];
     const sqlite = rollout.threadId ? rowsById.get(rollout.threadId) : null;
-    return {
+    const sqliteFirstUserMessage = sqlite?.first_user_message ?? "";
+    const firstUserMessage = sqliteFirstUserMessage
+      || await readRolloutFirstUserMessage(resolveArchivePath(codexHome, rollout.relativePath));
+    conversations.push({
       index: index + 1,
       key: buildExportKey(rollout),
       threadId: rollout.threadId,
       scope: rollout.scope,
+      title: sqlite?.title ?? rollout.title ?? "",
       provider: rollout.provider ?? sqlite?.model_provider ?? "(missing)",
       cwd: rollout.cwd ?? sqlite?.cwd ?? "",
       timestamp: rollout.timestamp
         ?? sqlite?.updated_at_ms
         ?? sqlite?.created_at_ms
         ?? "",
-      firstUserMessage: sqlite?.first_user_message ?? "",
+      firstUserMessage,
       relativePath: rollout.relativePath,
       size: rollout.size
-    };
-  });
+    });
+  }
+  return conversations;
+}
+
+export async function readExportTranscript(codexHome, entry, { limit = DEFAULT_TRANSCRIPT_MESSAGE_LIMIT } = {}) {
+  if (!entry?.relativePath) {
+    throw new Error("Cannot read transcript because the selected conversation is missing rollout metadata.");
+  }
+  const filePath = resolveArchivePath(codexHome, entry.relativePath);
+  const { messages, truncated } = await scanRolloutMessages(filePath, { limit });
+  return {
+    threadId: entry.threadId ?? null,
+    title: entry.title ?? "",
+    relativePath: entry.relativePath,
+    scope: entry.scope,
+    provider: entry.provider ?? "",
+    cwd: entry.cwd ?? "",
+    timestamp: entry.timestamp ?? "",
+    messages,
+    truncated
+  };
 }
 
 export async function toggleExportConversationArchived(codexHome, entry) {

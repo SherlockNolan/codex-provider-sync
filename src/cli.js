@@ -395,6 +395,79 @@ function padVisible(value, width) {
   return `${text}${" ".repeat(width - length)}`;
 }
 
+function normalizeDisplayText(value) {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ")
+    .trim();
+}
+
+function wrapText(value, width, maxLines = Infinity) {
+  if (width <= 0 || maxLines <= 0) {
+    return [];
+  }
+  const paragraphs = normalizeDisplayText(value).split("\n");
+  const lines = [];
+  for (const paragraph of paragraphs) {
+    if (lines.length >= maxLines) {
+      break;
+    }
+    const words = paragraph.split(/(\s+)/).filter((part) => part.length > 0);
+    if (words.length === 0) {
+      lines.push("");
+      continue;
+    }
+    let current = "";
+    for (const word of words) {
+      if (lines.length >= maxLines) {
+        break;
+      }
+      if (/^\s+$/.test(word)) {
+        if (current && !current.endsWith(" ")) {
+          current += " ";
+        }
+        continue;
+      }
+      const candidate = current ? `${current}${word}` : word;
+      if (visibleLength(candidate) <= width) {
+        current = candidate;
+        continue;
+      }
+      if (current) {
+        lines.push(current.trimEnd());
+        current = "";
+        if (lines.length >= maxLines) {
+          break;
+        }
+      }
+      let chunk = "";
+      for (const char of Array.from(word)) {
+        const candidateChunk = `${chunk}${char}`;
+        if (visibleLength(candidateChunk) > width) {
+          if (chunk) {
+            lines.push(chunk);
+          }
+          chunk = char;
+          if (lines.length >= maxLines) {
+            break;
+          }
+        } else {
+          chunk = candidateChunk;
+        }
+      }
+      current = chunk;
+    }
+    if (current && lines.length < maxLines) {
+      lines.push(current.trimEnd());
+    }
+  }
+  if (lines.length > maxLines) {
+    return lines.slice(0, maxLines);
+  }
+  return lines;
+}
+
 const THEME = {
   reset: "\x1b[0m",
   dim: "\x1b[90m",
@@ -491,7 +564,7 @@ function formatExportBrowserRow(entry, { selected, active, odd, layout }) {
   const marker = selected ? "●" : "○";
   const pointer = active ? "›" : " ";
   const ageOrTime = entry.timestamp ? truncateText(entry.timestamp, layout.timeWidth) : "";
-  const title = entry.firstUserMessage || entry.threadId || entry.relativePath;
+  const title = entry.title || entry.firstUserMessage || entry.threadId || entry.relativePath;
   const plainLine = joinRowCells([
     padVisible(pointer, layout.gutterWidth),
     padVisible(marker, layout.checkWidth),
@@ -502,6 +575,57 @@ function formatExportBrowserRow(entry, { selected, active, odd, layout }) {
     formatCell(title, layout.titleWidth)
   ]);
   return colorRow(padVisible(plainLine, layout.width), { active, selected, odd });
+}
+
+function roleLabel(role) {
+  if (role === "user") {
+    return "You";
+  }
+  if (role === "assistant") {
+    return "Codex";
+  }
+  if (role === "system") {
+    return "System";
+  }
+  return "Msg";
+}
+
+function transcriptCacheItem(transcriptCache, key) {
+  return transcriptCache instanceof Map ? transcriptCache.get(key) : null;
+}
+
+function formatInlinePreviewRows(entry, { layout, transcriptCache, maxRows }) {
+  const cached = transcriptCacheItem(transcriptCache, entry.key);
+  const prefixWidth = Math.min(9, Math.max(5, Math.floor(layout.width * 0.14)));
+  const textWidth = Math.max(8, layout.width - prefixWidth - 3);
+  if (!cached) {
+    return [`${THEME.panel}${THEME.dim}${padVisible("  Loading preview...", layout.width)}${THEME.reset}`];
+  }
+  if (cached.error) {
+    return [`${THEME.panel}${THEME.warning}${padVisible(truncateText(`  ${cached.error}`, layout.width), layout.width)}${THEME.reset}`];
+  }
+  const messages = cached.messages ?? [];
+  if (messages.length === 0) {
+    return [`${THEME.panel}${THEME.dim}${padVisible("  No transcript messages found in rollout.", layout.width)}${THEME.reset}`];
+  }
+
+  const rows = [];
+  for (const message of messages.slice(0, 4)) {
+    if (rows.length >= maxRows) {
+      break;
+    }
+    const label = `${roleLabel(message.role)}:`;
+    const wrapped = wrapText(message.text, textWidth, Math.max(1, maxRows - rows.length));
+    for (let index = 0; index < wrapped.length && rows.length < maxRows; index += 1) {
+      const left = index === 0 ? label : "";
+      const line = `  ${formatCell(left, prefixWidth)} ${formatCell(wrapped[index], textWidth)}`;
+      rows.push(`${THEME.panel}${THEME.muted}${padVisible(line, layout.width)}${THEME.reset}`);
+    }
+  }
+  if (cached.truncated && rows.length < maxRows) {
+    rows.push(`${THEME.panel}${THEME.dim}${padVisible("  ... transcript is truncated", layout.width)}${THEME.reset}`);
+  }
+  return rows;
 }
 
 function formatExportBrowserHeader(layout) {
@@ -525,6 +649,8 @@ function renderExportBrowser({
   preview,
   filtered,
   selectedKeys,
+  transcriptCache,
+  expandedKey,
   cursor,
   scroll,
   query,
@@ -532,7 +658,7 @@ function renderExportBrowser({
   message
 }) {
   const layout = buildExportBrowserLayout();
-  const visible = filtered.slice(scroll, scroll + layout.bodyRows);
+  const visible = filtered.slice(scroll);
   const page = filtered.length === 0 ? 0 : Math.floor(scroll / layout.bodyRows) + 1;
   const pageCount = filtered.length === 0 ? 0 : Math.ceil(filtered.length / layout.bodyRows);
   const queryText = query ? `${THEME.accent}${truncateText(query, Math.max(1, layout.width - 18))}${THEME.reset}` : `${THEME.dim}(empty)${THEME.reset}`;
@@ -546,30 +672,111 @@ function renderExportBrowser({
     formatRule(layout.width)
   ];
 
-  for (let offset = 0; offset < layout.bodyRows; offset += 1) {
+  let renderedBodyRows = 0;
+  for (let offset = 0; renderedBodyRows < layout.bodyRows; offset += 1) {
     const entry = visible[offset];
     if (!entry) {
       const blank = " ".repeat(layout.width);
-      lines.push(`${offset % 2 ? THEME.panelAlt : THEME.panel}${blank}${THEME.reset}`);
+      lines.push(`${renderedBodyRows % 2 ? THEME.panelAlt : THEME.panel}${blank}${THEME.reset}`);
+      renderedBodyRows += 1;
       continue;
     }
     const active = scroll + offset === cursor;
     lines.push(formatExportBrowserRow(entry, {
       selected: selectedKeys.has(entry.key),
       active,
-      odd: offset % 2 === 1,
+      odd: renderedBodyRows % 2 === 1,
       layout
     }));
+    renderedBodyRows += 1;
+    if (entry.key === expandedKey && renderedBodyRows < layout.bodyRows) {
+      const previewRows = formatInlinePreviewRows(entry, {
+        layout,
+        transcriptCache,
+        maxRows: layout.bodyRows - renderedBodyRows
+      });
+      for (const previewRow of previewRows) {
+        if (renderedBodyRows >= layout.bodyRows) {
+          break;
+        }
+        lines.push(previewRow);
+        renderedBodyRows += 1;
+      }
+    }
   }
 
-  const footer = "↑/↓ browse  ←/→ PgUp/PgDn page  Space select  Tab archives  Delete archive/live  Ctrl+A all  Ctrl+N none  Enter export  Esc exit";
+  const footer = "↑/↓ browse  ←/→ PgUp/PgDn page  Space select  Ctrl+P preview  Ctrl+T transcript  Tab archives  Delete archive/live  Enter export  Esc exit";
   lines.push(formatRule(layout.width));
   lines.push(`${message ? THEME.warning : THEME.dim}${padVisible(truncateText(message || footer, layout.width), layout.width)}${THEME.reset}`);
   lines.push(`${THEME.dim}${padVisible(truncateText(preview.codexHome, layout.width), layout.width)}${THEME.reset}`);
   return `\x1b[?25l\x1b[H${lines.slice(0, layout.height).join("\n")}`;
 }
 
-async function chooseExportSelection(preview, { onToggleArchive } = {}) {
+function buildTranscriptLines(transcript, width) {
+  if (transcript?.error) {
+    return [transcript.error];
+  }
+  const messages = transcript?.messages ?? [];
+  if (messages.length === 0) {
+    return ["No transcript messages found in rollout."];
+  }
+  const labelWidth = Math.min(10, Math.max(6, Math.floor(width * 0.15)));
+  const textWidth = Math.max(12, width - labelWidth - 3);
+  const lines = [];
+  for (const message of messages) {
+    const label = `${roleLabel(message.role)}:`;
+    const wrapped = wrapText(message.text, textWidth, Infinity);
+    if (wrapped.length === 0) {
+      lines.push(`${formatCell(label, labelWidth)} `);
+      continue;
+    }
+    for (let index = 0; index < wrapped.length; index += 1) {
+      const left = index === 0 ? label : "";
+      lines.push(`${formatCell(left, labelWidth)} ${wrapped[index]}`);
+    }
+    lines.push("");
+  }
+  if (transcript.truncated) {
+    lines.push("... transcript is truncated");
+  }
+  return lines;
+}
+
+function renderTranscriptBrowser({ entry, transcript, scroll, message }) {
+  const layout = buildExportBrowserLayout();
+  const title = entry.title || entry.firstUserMessage || entry.threadId || entry.relativePath;
+  const meta = [
+    entry.scope === "archived_sessions" ? "archived" : "live",
+    entry.provider,
+    entry.timestamp,
+    entry.relativePath
+  ].filter(Boolean).join("  ");
+  const bodyRows = Math.max(3, layout.height - 5);
+  const transcriptLines = buildTranscriptLines(transcript, layout.width);
+  const maxScroll = Math.max(0, transcriptLines.length - bodyRows);
+  const safeScroll = Math.max(0, Math.min(scroll, maxScroll));
+  const lines = [
+    `${THEME.header}${padVisible(truncateText(title, layout.width), layout.width)}${THEME.reset}`,
+    `${THEME.dim}${padVisible(truncateText(meta, layout.width), layout.width)}${THEME.reset}`,
+    formatRule(layout.width)
+  ];
+  const visible = transcriptLines.slice(safeScroll, safeScroll + bodyRows);
+  for (let index = 0; index < bodyRows; index += 1) {
+    const text = visible[index] ?? "";
+    const color = transcript?.error ? THEME.warning : THEME.muted;
+    lines.push(`${index % 2 ? THEME.panelAlt : THEME.panel}${color}${padVisible(truncateText(text, layout.width), layout.width)}${THEME.reset}`);
+  }
+  const footer = `↑/↓ scroll  PgUp/PgDn page  Home/End  Ctrl+T/Esc back  ${safeScroll + 1}/${Math.max(1, transcriptLines.length)}`;
+  lines.push(formatRule(layout.width));
+  lines.push(`${message ? THEME.warning : THEME.dim}${padVisible(truncateText(message || footer, layout.width), layout.width)}${THEME.reset}`);
+  return {
+    text: `\x1b[?25l\x1b[H${lines.slice(0, layout.height).join("\n")}`,
+    scroll: safeScroll,
+    maxScroll
+  };
+}
+
+async function chooseExportSelection(preview, { onToggleArchive, onLoadTranscript } = {}) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("Interactive export selection requires a terminal. Use --ids <thread-id[,thread-id]> for non-interactive exports.");
   }
@@ -580,10 +787,14 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
   readline.emitKeypressEvents(process.stdin);
   const previousRawMode = process.stdin.isRaw;
   const selectedKeys = new Set();
+  const transcriptCache = new Map();
   let query = "";
   let includeArchived = true;
   let cursor = 0;
   let scroll = 0;
+  let expandedKey = null;
+  let transcriptView = null;
+  let transcriptScroll = 0;
   let message = "";
   let busy = false;
 
@@ -612,12 +823,26 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
   }
 
   function render() {
+    if (transcriptView) {
+      const rendered = renderTranscriptBrowser({
+        entry: transcriptView.entry,
+        transcript: transcriptView.transcript,
+        scroll: transcriptScroll,
+        message
+      });
+      transcriptScroll = rendered.scroll;
+      process.stdout.write(rendered.text);
+      message = "";
+      return;
+    }
     const filtered = filteredEntries();
     clampView(filtered);
     process.stdout.write(renderExportBrowser({
       preview,
       filtered,
       selectedKeys,
+      transcriptCache,
+      expandedKey,
       cursor,
       scroll,
       query,
@@ -662,6 +887,71 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
       move(delta * bodyHeight());
     }
 
+    async function loadTranscriptForEntry(entry) {
+      if (!entry) {
+        return { error: "No conversation under cursor.", messages: [] };
+      }
+      if (transcriptCache.has(entry.key)) {
+        return transcriptCache.get(entry.key);
+      }
+      if (typeof onLoadTranscript !== "function") {
+        const unavailable = { error: "Transcript loading is not available.", messages: [] };
+        transcriptCache.set(entry.key, unavailable);
+        return unavailable;
+      }
+      try {
+        const transcript = await onLoadTranscript(entry);
+        transcriptCache.set(entry.key, transcript);
+        return transcript;
+      } catch (error) {
+        const failed = {
+          error: error instanceof Error ? error.message : String(error),
+          messages: []
+        };
+        transcriptCache.set(entry.key, failed);
+        return failed;
+      }
+    }
+
+    async function toggleInlinePreview() {
+      const entry = filteredEntries()[cursor];
+      if (!entry) {
+        message = "No conversation under cursor.";
+        render();
+        return;
+      }
+      if (expandedKey === entry.key) {
+        expandedKey = null;
+        render();
+        return;
+      }
+      expandedKey = entry.key;
+      if (!transcriptCache.has(entry.key)) {
+        busy = true;
+        render();
+        await loadTranscriptForEntry(entry);
+        busy = false;
+      }
+      render();
+    }
+
+    async function openTranscriptForCurrentEntry() {
+      const entry = filteredEntries()[cursor];
+      if (!entry) {
+        message = "No conversation under cursor.";
+        render();
+        return;
+      }
+      busy = true;
+      message = `Loading transcript for ${entry.threadId ?? entry.relativePath}...`;
+      render();
+      const transcript = await loadTranscriptForEntry(entry);
+      transcriptView = { entry, transcript };
+      transcriptScroll = 0;
+      busy = false;
+      render();
+    }
+
     async function toggleArchiveForCurrentEntry() {
       if (typeof onToggleArchive !== "function") {
         message = "Archive toggle is not available.";
@@ -689,6 +979,13 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
           selectedKeys.delete(entry.key);
           selectedKeys.add(updated.key);
         }
+        if (transcriptCache.has(entry.key) && updated.key !== entry.key) {
+          transcriptCache.set(updated.key, transcriptCache.get(entry.key));
+          transcriptCache.delete(entry.key);
+        }
+        if (expandedKey === entry.key) {
+          expandedKey = updated.key;
+        }
         message = `${updated.scope === "archived_sessions" ? "Archived" : "Restored"} ${updated.threadId ?? updated.relativePath}.`;
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
@@ -706,8 +1003,35 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
         finish(new Error("History export aborted by user."));
         return;
       }
+      if (transcriptView) {
+        const layout = buildExportBrowserLayout();
+        const transcriptLines = buildTranscriptLines(transcriptView.transcript, layout.width);
+        const maxScroll = Math.max(0, transcriptLines.length - Math.max(3, layout.height - 5));
+        if (key.name === "escape" || (key.ctrl && key.name === "t")) {
+          transcriptView = null;
+          transcriptScroll = 0;
+        } else if (key.name === "up") {
+          transcriptScroll = Math.max(0, transcriptScroll - 1);
+        } else if (key.name === "down") {
+          transcriptScroll = Math.min(maxScroll, transcriptScroll + 1);
+        } else if (key.name === "pageup" || key.name === "left") {
+          transcriptScroll = Math.max(0, transcriptScroll - Math.max(3, layout.height - 5));
+        } else if (key.name === "pagedown" || key.name === "right") {
+          transcriptScroll = Math.min(maxScroll, transcriptScroll + Math.max(3, layout.height - 5));
+        } else if (key.name === "home") {
+          transcriptScroll = 0;
+        } else if (key.name === "end") {
+          transcriptScroll = maxScroll;
+        }
+        render();
+        return;
+      }
       if (key.name === "escape") {
         finish(new Error("History export aborted by user."));
+        return;
+      }
+      if (key.ctrl && key.name === "t") {
+        await openTranscriptForCurrentEntry();
         return;
       }
       if (key.ctrl && key.name === "a") {
@@ -748,6 +1072,9 @@ async function chooseExportSelection(preview, { onToggleArchive } = {}) {
         message = includeArchived ? "Archived conversations are visible." : "Archived conversations are hidden.";
       } else if (key.name === "delete") {
         await toggleArchiveForCurrentEntry();
+        return;
+      } else if (key.ctrl && key.name === "p") {
+        await toggleInlinePreview();
         return;
       } else if (key.name === "home") {
         cursor = 0;
@@ -889,6 +1216,7 @@ async function main() {
   if (command === "export") {
     const {
       getExportHistoryPreview,
+      getExportHistoryTranscript,
       parseExportThreadIds,
       runExportHistory,
       toggleExportHistoryArchived
@@ -903,6 +1231,12 @@ async function main() {
           {
             onToggleArchive(entry) {
               return toggleExportHistoryArchived({
+                codexHome: flags["codex-home"],
+                entry
+              });
+            },
+            onLoadTranscript(entry) {
+              return getExportHistoryTranscript({
                 codexHome: flags["codex-home"],
                 entry
               });
