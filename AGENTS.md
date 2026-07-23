@@ -66,6 +66,7 @@ Use `codex-provider export <archive-path>` when:
 - the user asks for a portable backup/archive of sessions and SQLite thread metadata
 - use `codex-provider export --select` when the user wants to preview and choose specific conversations
 - use `codex-provider export <archive-path> --ids <id[,id]>` for automated partial exports
+- in the export TUI, `Tab` shows/hides archived items and `Delete` toggles the highlighted conversation between active and archived state
 
 Use `codex-provider import <archive-path>` when:
 

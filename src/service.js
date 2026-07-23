@@ -52,7 +52,8 @@ import {
   extractHistoryArchive,
   mergeImportedSqliteThreads,
   resolveImportConflicts,
-  summarizeImportPlan
+  summarizeImportPlan,
+  toggleExportConversationArchived
 } from "./history-transfer.js";
 
 function normalizeCodexHome(explicitCodexHome) {
@@ -593,6 +594,20 @@ export async function getExportHistoryPreview({ codexHome: explicitCodexHome } =
     codexHome,
     conversations: await buildExportPreview(codexHome)
   };
+}
+
+export async function toggleExportHistoryArchived({
+  codexHome: explicitCodexHome,
+  entry
+} = {}) {
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const releaseLock = await acquireLock(codexHome, "toggle-history-archive");
+  try {
+    return await toggleExportConversationArchived(codexHome, entry);
+  } finally {
+    await releaseLock();
+  }
 }
 
 async function syncProviderMetadataAfterImport({

@@ -14,7 +14,8 @@ import { openDatabase } from "./sqlite.js";
 import {
   detectStateDb,
   existingStateDbPath,
-  stateDbPath
+  wrapSqliteBusyError,
+  wrapSqliteMalformedError
 } from "./sqlite-state.js";
 
 const HISTORY_NAMESPACE = "provider-sync-history";
@@ -178,6 +179,67 @@ function selectedThreadIdsFromRollouts(rollouts) {
     .filter((threadId) => typeof threadId === "string" && threadId);
 }
 
+function oppositeSessionScope(scope) {
+  if (scope === "sessions") {
+    return "archived_sessions";
+  }
+  if (scope === "archived_sessions") {
+    return "sessions";
+  }
+  throw new Error(`Cannot toggle archive state for unsupported scope: ${scope}`);
+}
+
+function replaceRelativePathScope(relativePath, nextScope) {
+  const normalized = validateRelativePath(relativePath);
+  const parts = normalized.split("/");
+  if (!SESSION_DIRS.includes(parts[0])) {
+    throw new Error(`Cannot toggle archive state for rollout outside sessions directories: ${relativePath}`);
+  }
+  parts[0] = nextScope;
+  return parts.join("/");
+}
+
+async function updateThreadArchivedFlag(codexHome, threadId, archived) {
+  if (!threadId) {
+    return 0;
+  }
+  const dbPath = await existingStateDbPath(codexHome);
+  if (!dbPath) {
+    return 0;
+  }
+
+  let db;
+  let transactionOpen = false;
+  try {
+    db = await openDatabase(dbPath);
+    if (!tableExists(db, "threads") || !tableColumns(db, "threads").includes("archived")) {
+      return 0;
+    }
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+    const result = db
+      .prepare("UPDATE threads SET archived = ? WHERE id = ?")
+      .run(archived ? 1 : 0, threadId);
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return result.changes ?? 0;
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        db?.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures and surface the original SQLite error.
+      }
+    }
+    throw wrapSqliteMalformedError(
+      wrapSqliteBusyError(error, "toggle archived session state"),
+      "toggle archived session state"
+    );
+  } finally {
+    db?.close();
+  }
+}
+
 export async function collectRolloutInventory(codexHome) {
   const rollouts = [];
   for (const scope of SESSION_DIRS) {
@@ -300,6 +362,51 @@ export async function buildExportPreview(codexHome) {
       size: rollout.size
     };
   });
+}
+
+export async function toggleExportConversationArchived(codexHome, entry) {
+  if (!entry?.relativePath || !entry.scope) {
+    throw new Error("Cannot toggle archive state because the selected conversation is missing rollout metadata.");
+  }
+
+  const nextScope = oppositeSessionScope(entry.scope);
+  const nextRelativePath = replaceRelativePathScope(entry.relativePath, nextScope);
+  const sourcePath = resolveArchivePath(codexHome, entry.relativePath);
+  const destinationPath = resolveArchivePath(codexHome, nextRelativePath);
+
+  if (await pathExists(destinationPath)) {
+    throw new Error(`Cannot toggle archive state because target rollout already exists: ${nextRelativePath}`);
+  }
+
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.rename(sourcePath, destinationPath);
+  let sqliteRowsUpdated = 0;
+  try {
+    sqliteRowsUpdated = await updateThreadArchivedFlag(codexHome, entry.threadId, nextScope === "archived_sessions");
+  } catch (error) {
+    try {
+      await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+      await fs.rename(destinationPath, sourcePath);
+    } catch (rollbackError) {
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+      throw new Error(
+        `Failed to restore rollout after archive toggle error. Original error: ${originalMessage}. Restore error: ${rollbackMessage}`
+      );
+    }
+    throw error;
+  }
+
+  const stat = await fs.stat(destinationPath);
+  return {
+    ...entry,
+    scope: nextScope,
+    relativePath: nextRelativePath,
+    key: entry.threadId ? `thread:${entry.threadId}` : `path:${nextRelativePath}`,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    sqliteRowsUpdated
+  };
 }
 
 export async function createHistoryArchive({

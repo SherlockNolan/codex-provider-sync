@@ -8,7 +8,8 @@ import path from "node:path";
 import {
   getExportHistoryPreview,
   runExportHistory,
-  runImportHistory
+  runImportHistory,
+  toggleExportHistoryArchived
 } from "../src/service.js";
 import {
   DB_FILE_BASENAME,
@@ -211,6 +212,40 @@ test("selected export includes only chosen conversations and merges them increme
   await fs.access(path.join(targetHome, "sessions", "2026", "03", "20", "rollout-thread-b.jsonl"));
   await assert.rejects(fs.access(path.join(targetHome, "sessions", "2026", "03", "19", "rollout-thread-a.jsonl")));
   await assert.rejects(fs.access(path.join(targetHome, "archived_sessions", "2026", "03", "21", "rollout-thread-c.jsonl")));
+});
+
+test("toggleExportHistoryArchived moves rollout files and updates SQLite archived flag", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const activePath = await writeRollout(codexHome, "sessions", "19", "thread-toggle", "openai", "toggle me");
+  await writeStateDb(codexHome, [
+    { id: "thread-toggle", model_provider: "openai", archived: false, first_user_message: "toggle sqlite" }
+  ]);
+
+  let preview = await getExportHistoryPreview({ codexHome });
+  const activeEntry = preview.conversations.find((entry) => entry.threadId === "thread-toggle");
+  const archivedEntry = await toggleExportHistoryArchived({ codexHome, entry: activeEntry });
+
+  assert.equal(archivedEntry.scope, "archived_sessions");
+  await assert.rejects(fs.access(activePath));
+  const archivedPath = path.join(codexHome, "archived_sessions", "2026", "03", "19", "rollout-thread-toggle.jsonl");
+  await fs.access(archivedPath);
+  assert.deepEqual(await readThreadRows(codexHome), [
+    { id: "thread-toggle", model_provider: "openai", archived: 1, first_user_message: "toggle sqlite" }
+  ]);
+
+  preview = await getExportHistoryPreview({ codexHome });
+  const restoredEntry = await toggleExportHistoryArchived({
+    codexHome,
+    entry: preview.conversations.find((entry) => entry.threadId === "thread-toggle")
+  });
+
+  assert.equal(restoredEntry.scope, "sessions");
+  await fs.access(activePath);
+  await assert.rejects(fs.access(archivedPath));
+  assert.deepEqual(await readThreadRows(codexHome), [
+    { id: "thread-toggle", model_provider: "openai", archived: 0, first_user_message: "toggle sqlite" }
+  ]);
 });
 
 test("runImportHistory imports into a Codex home without SQLite and rewrites provider to current provider", async () => {

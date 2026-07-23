@@ -133,7 +133,7 @@ To migrate only selected conversations, preview first and choose by number:
 codex-provider export --select
 ```
 
-The browser shows thread id, active/archived state, provider, timestamp, first user message preview, cwd, and rollout path. Type to search, use `Up/Down` to browse, `Space` to toggle selection, `Left/Right` or `PageUp/PageDown` to page, `Enter` to export, and `Esc` to exit.
+The browser shows thread id, active/archived state, provider, timestamp, first user message preview, cwd, and rollout path. Type to search, use `Up/Down` to browse, `Space` to toggle selection, `Left/Right` or `PageUp/PageDown` to page, `Tab` to show/hide archived items, `Delete` to toggle the current item between active/archived, `Enter` to export, and `Esc` to exit.
 
 For automation, pass thread ids directly:
 

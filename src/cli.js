@@ -422,12 +422,14 @@ function searchableExportText(entry) {
   ].filter(Boolean).join("\n").toLowerCase();
 }
 
-function filterExportPreviewEntries(conversations, query) {
+function filterExportPreviewEntries(conversations, query, { includeArchived = true } = {}) {
   const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) {
-    return conversations;
-  }
-  return conversations.filter((entry) => searchableExportText(entry).includes(normalizedQuery));
+  return conversations.filter((entry) => {
+    if (!includeArchived && entry.scope === "archived_sessions") {
+      return false;
+    }
+    return !normalizedQuery || searchableExportText(entry).includes(normalizedQuery);
+  });
 }
 
 function buildExportBrowserLayout() {
@@ -526,6 +528,7 @@ function renderExportBrowser({
   cursor,
   scroll,
   query,
+  includeArchived,
   message
 }) {
   const layout = buildExportBrowserLayout();
@@ -533,7 +536,8 @@ function renderExportBrowser({
   const page = filtered.length === 0 ? 0 : Math.floor(scroll / layout.bodyRows) + 1;
   const pageCount = filtered.length === 0 ? 0 : Math.ceil(filtered.length / layout.bodyRows);
   const queryText = query ? `${THEME.accent}${truncateText(query, Math.max(1, layout.width - 18))}${THEME.reset}` : `${THEME.dim}(empty)${THEME.reset}`;
-  const countText = `${THEME.muted}Filtered ${filtered.length}/${preview.conversations.length}  Selected ${selectedKeys.size}  Page ${page}/${pageCount}${THEME.reset}`;
+  const archiveText = includeArchived ? "Archives on" : "Archives off";
+  const countText = `${THEME.muted}Filtered ${filtered.length}/${preview.conversations.length}  Selected ${selectedKeys.size}  ${archiveText}  Page ${page}/${pageCount}${THEME.reset}`;
   const topLine = `${THEME.header}Type to search:${THEME.reset} ${queryText}`;
   const lines = [
     padVisible(topLine, layout.width),
@@ -558,14 +562,14 @@ function renderExportBrowser({
     }));
   }
 
-  const footer = "↑/↓ browse  ←/→ PgUp/PgDn page  Space select  Ctrl+A all  Ctrl+N none  Enter export  Esc exit";
+  const footer = "↑/↓ browse  ←/→ PgUp/PgDn page  Space select  Tab archives  Delete archive/live  Ctrl+A all  Ctrl+N none  Enter export  Esc exit";
   lines.push(formatRule(layout.width));
   lines.push(`${message ? THEME.warning : THEME.dim}${padVisible(truncateText(message || footer, layout.width), layout.width)}${THEME.reset}`);
   lines.push(`${THEME.dim}${padVisible(truncateText(preview.codexHome, layout.width), layout.width)}${THEME.reset}`);
   return `\x1b[?25l\x1b[H${lines.slice(0, layout.height).join("\n")}`;
 }
 
-async function chooseExportSelection(preview) {
+async function chooseExportSelection(preview, { onToggleArchive } = {}) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("Interactive export selection requires a terminal. Use --ids <thread-id[,thread-id]> for non-interactive exports.");
   }
@@ -577,12 +581,14 @@ async function chooseExportSelection(preview) {
   const previousRawMode = process.stdin.isRaw;
   const selectedKeys = new Set();
   let query = "";
+  let includeArchived = true;
   let cursor = 0;
   let scroll = 0;
   let message = "";
+  let busy = false;
 
   function filteredEntries() {
-    return filterExportPreviewEntries(preview.conversations, query);
+    return filterExportPreviewEntries(preview.conversations, query, { includeArchived });
   }
 
   function bodyHeight() {
@@ -615,6 +621,7 @@ async function chooseExportSelection(preview) {
       cursor,
       scroll,
       query,
+      includeArchived,
       message
     }));
     message = "";
@@ -655,7 +662,46 @@ async function chooseExportSelection(preview) {
       move(delta * bodyHeight());
     }
 
-    function onKeyPress(str, key = {}) {
+    async function toggleArchiveForCurrentEntry() {
+      if (typeof onToggleArchive !== "function") {
+        message = "Archive toggle is not available.";
+        return;
+      }
+      const entry = filteredEntries()[cursor];
+      if (!entry) {
+        message = "No conversation under cursor.";
+        return;
+      }
+      busy = true;
+      message = `Toggling ${entry.threadId ?? entry.relativePath}...`;
+      render();
+      try {
+        const updated = await onToggleArchive(entry);
+        const index = preview.conversations.findIndex((candidate) => candidate.key === entry.key);
+        if (index !== -1) {
+          preview.conversations[index] = {
+            ...preview.conversations[index],
+            ...updated,
+            index: preview.conversations[index].index
+          };
+        }
+        if (selectedKeys.has(entry.key) && updated.key !== entry.key) {
+          selectedKeys.delete(entry.key);
+          selectedKeys.add(updated.key);
+        }
+        message = `${updated.scope === "archived_sessions" ? "Archived" : "Restored"} ${updated.threadId ?? updated.relativePath}.`;
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      } finally {
+        busy = false;
+        render();
+      }
+    }
+
+    async function onKeyPress(str, key = {}) {
+      if (busy) {
+        return;
+      }
       if (key.ctrl && key.name === "c") {
         finish(new Error("History export aborted by user."));
         return;
@@ -695,6 +741,14 @@ async function chooseExportSelection(preview) {
         page(-1);
       } else if (key.name === "right" || key.name === "pagedown") {
         page(1);
+      } else if (key.name === "tab") {
+        includeArchived = !includeArchived;
+        cursor = 0;
+        scroll = 0;
+        message = includeArchived ? "Archived conversations are visible." : "Archived conversations are hidden.";
+      } else if (key.name === "delete") {
+        await toggleArchiveForCurrentEntry();
+        return;
       } else if (key.name === "home") {
         cursor = 0;
       } else if (key.name === "end") {
@@ -833,13 +887,28 @@ async function main() {
   }
 
   if (command === "export") {
-    const { getExportHistoryPreview, parseExportThreadIds, runExportHistory } = await loadService();
+    const {
+      getExportHistoryPreview,
+      parseExportThreadIds,
+      runExportHistory,
+      toggleExportHistoryArchived
+    } = await loadService();
     const archivePath = positionals[1] ?? flags.output;
     if (flags.select && flags.ids) {
       throw new Error("Use either --select or --ids, not both.");
     }
     const selectionKeys = flags.select
-      ? await chooseExportSelection(await getExportHistoryPreview({ codexHome: flags["codex-home"] }))
+      ? await chooseExportSelection(
+          await getExportHistoryPreview({ codexHome: flags["codex-home"] }),
+          {
+            onToggleArchive(entry) {
+              return toggleExportHistoryArchived({
+                codexHome: flags["codex-home"],
+                entry
+              });
+            }
+          }
+        )
       : null;
     const result = await runExportHistory({
       codexHome: flags["codex-home"],
