@@ -24,7 +24,8 @@ import {
   pruneBackups,
   refreshBackupInventory,
   restoreBackup,
-  restoreGlobalStateFilesFromBackup
+  restoreGlobalStateFilesFromBackup,
+  updateSessionBackupManifest
 } from "./backup.js";
 import { acquireLock } from "./locking.js";
 import {
@@ -145,6 +146,10 @@ async function prepareStorage({ codexHome: explicitCodexHome, sqliteHome, config
   return withStateDbLocation(layout, await detectStateDb(layout));
 }
 
+async function ensureCodexHomePath(codexHome) {
+  await ensureCodexHome(resolveStorageLayout({ codexHome, env: {} }));
+}
+
 async function readConfigTextOrEmpty(configPath) {
   try {
     return await readConfigText(configPath);
@@ -154,6 +159,18 @@ async function readConfigTextOrEmpty(configPath) {
     }
     throw error;
   }
+}
+
+async function filterChangesCoveredByBackup(backupDir, changes) {
+  if (!changes.length) {
+    return [];
+  }
+  const manifestPath = path.join(backupDir, "session-meta-backup.json");
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  const backedUpPaths = new Set(
+    (manifest.files ?? []).map((entry) => pathComparisonKey(entry.path))
+  );
+  return changes.filter((change) => backedUpPaths.has(pathComparisonKey(change.path)));
 }
 
 function formatCounts(counts) {
@@ -1146,7 +1163,7 @@ export async function runExportHistory({
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
   const resolvedArchivePath = archivePath ? path.resolve(archivePath) : defaultHistoryArchivePath();
-  await ensureCodexHome(codexHome);
+  await ensureCodexHomePath(codexHome);
   let resolvedSelectionKeys = selectionKeys ?? null;
   if (!resolvedSelectionKeys && threadIds?.length) {
     const preview = await buildExportPreview(codexHome);
@@ -1180,7 +1197,7 @@ export async function runExportHistory({
 
 export async function getExportHistoryPreview({ codexHome: explicitCodexHome } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
+  await ensureCodexHomePath(codexHome);
   return {
     codexHome,
     conversations: await buildExportPreview(codexHome)
@@ -1192,7 +1209,7 @@ export async function toggleExportHistoryArchived({
   entry
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
+  await ensureCodexHomePath(codexHome);
   const releaseLock = await acquireLock(codexHome, "toggle-history-archive");
   try {
     return await toggleExportConversationArchived(codexHome, entry);
@@ -1207,7 +1224,7 @@ export async function getExportHistoryTranscript({
   limit
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
+  await ensureCodexHomePath(codexHome);
   return readExportTranscript(codexHome, entry, { limit });
 }
 
@@ -1250,7 +1267,11 @@ async function syncProviderMetadataAfterImport({
         applyResult = await applySessionChanges(writableChanges);
         const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
         const appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
-        await updateSessionBackupManifest(backupDir, appliedSessionChanges);
+        const backedUpSessionChanges = await filterChangesCoveredByBackup(
+          backupDir,
+          appliedSessionChanges
+        );
+        await updateSessionBackupManifest(backupDir, backedUpSessionChanges);
       }
       workspaceRootResult = await syncWorkspaceRoots(codexHome, { cwdStats });
     },
@@ -1299,7 +1320,7 @@ export async function runImportHistory({
   }
 
   const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
+  await ensureCodexHomePath(codexHome);
   const configPath = path.join(codexHome, "config.toml");
   const configText = await readConfigTextOrEmpty(configPath);
   const current = readCurrentProviderFromConfigText(configText);
