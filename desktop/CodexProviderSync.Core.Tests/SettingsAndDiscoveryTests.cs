@@ -3,6 +3,97 @@ namespace CodexProviderSync.Core.Tests;
 public sealed class SettingsAndDiscoveryTests
 {
     [Fact]
+    public void ConfigFileService_ReadsBasicAndLiteralSqliteHome()
+    {
+        ConfigFileService service = new();
+
+        Assert.Equal(
+            @"C:\Users\cheng\.codex\sqlite",
+            service.ReadSqliteHomeFromConfigText("sqlite_home = 'C:\\Users\\cheng\\.codex\\sqlite'\n[model_providers.custom]\n"));
+        Assert.Equal(
+            "C:\\Users\\cheng\\.codex\\sqlite",
+            service.ReadSqliteHomeFromConfigText("sqlite_home = \"C:\\\\Users\\\\cheng\\\\.codex\\\\sqlite\" # comment\n"));
+    }
+
+    [Fact]
+    public void StorageLayout_UsesExplicitConfigEnvironmentAndDefaultPrecedence()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"storage-layout-{Guid.NewGuid():N}");
+        string codexHome = Path.Combine(root, ".codex");
+        CodexStorageLayoutService service = new();
+        Dictionary<string, string?> environment = new()
+        {
+            ["CODEX_SQLITE_HOME"] = Path.Combine(root, "env")
+        };
+
+        CodexStorageLayout explicitLayout = service.Resolve(
+            codexHome,
+            Path.Combine(root, "explicit"),
+            $"sqlite_home = '{Path.Combine(root, "config")}'\n",
+            environment);
+        CodexStorageLayout configLayout = service.Resolve(
+            codexHome,
+            null,
+            $"sqlite_home = '{Path.Combine(root, "config")}'\n",
+            environment);
+        CodexStorageLayout environmentLayout = service.Resolve(codexHome, null, string.Empty, environment);
+        CodexStorageLayout defaultLayout = service.Resolve(
+            codexHome,
+            null,
+            string.Empty,
+            new Dictionary<string, string?>());
+
+        Assert.Equal("gui", explicitLayout.SqliteHomeSource);
+        Assert.Equal("config", configLayout.SqliteHomeSource);
+        Assert.Equal("env", environmentLayout.SqliteHomeSource);
+        Assert.Equal("default", defaultLayout.SqliteHomeSource);
+        Assert.Single(explicitLayout.StateDbCandidates);
+        Assert.Equal(2, defaultLayout.StateDbCandidates.Count);
+    }
+
+    [Theory]
+    [InlineData(@"\\wsl.localhost\Ubuntu\home\user\.codex\sqlite")]
+    [InlineData(@"\\WSL$\Ubuntu\home\user\.codex\sqlite")]
+    [InlineData(@"\\?\UNC\wsl.localhost\Ubuntu\home\user\.codex\sqlite")]
+    public void StorageLayout_RejectsWslUncSqliteHomesOnlyForWindowsProcesses(string sqliteHome)
+    {
+        string codexHome = Path.Combine(Path.GetTempPath(), $"storage-layout-{Guid.NewGuid():N}", ".codex");
+        CodexStorageLayout layout = new CodexStorageLayoutService().Resolve(
+            codexHome,
+            sqliteHome,
+            string.Empty,
+            new Dictionary<string, string?>());
+
+        Assert.Equal(!OperatingSystem.IsWindows(), layout.SqliteAccess.Supported);
+        Assert.Equal(
+            OperatingSystem.IsWindows() ? "windows-wsl-unc" : null,
+            layout.SqliteAccess.Reason);
+    }
+
+    [Fact]
+    public void ConfigFileService_UpdatesCompactRootModelAssignment()
+    {
+        ConfigFileService service = new();
+
+        string updated = service.SetRootModelInConfigText(
+            "model_provider=\"openai\"\nmodel=\"old\"\n\n[model_providers.apigather]\nmodel=\"section\"\n",
+            "new");
+
+        Assert.Contains("model = \"new\"", updated);
+        Assert.Contains("model=\"section\"", updated);
+        Assert.Equal(1, updated.Split("model = \"new\"", StringSplitOptions.None).Length - 1);
+    }
+
+    [Fact]
+    public void ConfigFileService_ReadsProviderModel_WhenProviderIdContainsRegexCharacters()
+    {
+        ConfigFileService service = new();
+        string config = "[model_providers.foo.bar+v2]\nmodel = \"special\"\n";
+
+        Assert.Equal("special", service.ReadProviderModel(config, "foo.bar+v2"));
+    }
+
+    [Fact]
     public async Task SettingsService_PersistsRecentPathsAndProviders()
     {
         string uniqueSettingsRoot = Path.Combine(Path.GetTempPath(), $"codex-provider-settings-{Guid.NewGuid():N}");
@@ -14,7 +105,8 @@ public sealed class SettingsAndDiscoveryTests
             ManualProviders = ["custom-a"],
             LastSelectedProvider = "apigather",
             BackupRetentionCount = 7,
-            UiLanguage = "zh-Hans"
+            UiLanguage = "zh-Hans",
+            LastAutomaticUpdateCheckDate = new DateOnly(2026, 7, 23)
         };
 
         await service.SaveAsync(settings);
@@ -25,6 +117,68 @@ public sealed class SettingsAndDiscoveryTests
         Assert.Equal("apigather", loaded.LastSelectedProvider);
         Assert.Equal(7, loaded.BackupRetentionCount);
         Assert.Equal("zh-Hans", loaded.UiLanguage);
+        Assert.Equal(new DateOnly(2026, 7, 23), loaded.LastAutomaticUpdateCheckDate);
+    }
+
+    [Fact]
+    public async Task SettingsService_PersistsSqliteHomeOverridePerCodexHome()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"codex-provider-settings-{Guid.NewGuid():N}");
+        SettingsService service = new(Path.Combine(root, "settings.json"));
+        string codexHomeA = Path.Combine(root, "codex-a");
+        string codexHomeB = Path.Combine(root, "codex-b");
+        string sqliteHomeA = Path.Combine(root, "sqlite-a");
+
+        AppSettings settings = service.RecordSqliteHomeOverride(new AppSettings(), codexHomeA, sqliteHomeA);
+        settings = service.RecordCodexHome(settings, codexHomeB);
+        await service.SaveAsync(settings);
+        AppSettings loaded = await service.LoadAsync();
+
+        Assert.Equal(Path.GetFullPath(sqliteHomeA), service.GetSqliteHomeOverride(loaded, codexHomeA));
+        Assert.Null(service.GetSqliteHomeOverride(loaded, codexHomeB));
+    }
+
+    [Fact]
+    public async Task SettingsService_OldSettingsDefaultToNoAutomaticUpdateCheck()
+    {
+        string uniqueSettingsRoot = Path.Combine(Path.GetTempPath(), $"codex-provider-settings-{Guid.NewGuid():N}");
+        string settingsPath = Path.Combine(uniqueSettingsRoot, "settings.json");
+        Directory.CreateDirectory(uniqueSettingsRoot);
+        await File.WriteAllTextAsync(settingsPath, """{"backupRetentionCount":5,"uiLanguage":"zh-Hans"}""");
+
+        try
+        {
+            SettingsService service = new(settingsPath);
+
+            AppSettings loaded = await service.LoadAsync();
+
+            Assert.Null(loaded.LastAutomaticUpdateCheckDate);
+        }
+        finally
+        {
+            Directory.Delete(uniqueSettingsRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SettingsService_RecordAutomaticUpdateCheckPreservesOtherState()
+    {
+        SettingsService service = new(Path.Combine(Path.GetTempPath(), $"unused-{Guid.NewGuid():N}.json"));
+        AppSettings settings = new()
+        {
+            LastCodexHome = @"C:\Users\Administrator\.codex",
+            SavedProviders = ["openai"],
+            LastSelectedProvider = "openai",
+            BackupRetentionCount = 7
+        };
+
+        AppSettings updated = service.RecordAutomaticUpdateCheck(settings, new DateOnly(2026, 7, 23));
+
+        Assert.Equal(new DateOnly(2026, 7, 23), updated.LastAutomaticUpdateCheckDate);
+        Assert.Equal(settings.LastCodexHome, updated.LastCodexHome);
+        Assert.Equal(settings.LastSelectedProvider, updated.LastSelectedProvider);
+        Assert.Equal(settings.BackupRetentionCount, updated.BackupRetentionCount);
+        Assert.Contains("openai", updated.SavedProviders);
     }
 
     [Fact]

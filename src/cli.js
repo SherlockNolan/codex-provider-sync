@@ -16,14 +16,26 @@ function printHelp() {
   console.log(`codex-provider
 
 Usage:
-  codex-provider status [--codex-home PATH]
-  codex-provider sync [--provider ID] [--keep N] [--codex-home PATH]
-  codex-provider switch <provider-id> [--keep N] [--codex-home PATH]
+  codex-provider status [--codex-home PATH] [--sqlite-home PATH]
+  codex-provider sync [--provider ID] [--keep N] [--codex-home PATH] [--sqlite-home PATH]
+  codex-provider switch <provider-id> [--model NAME] [--keep-root-model] [--keep N] [--codex-home PATH] [--sqlite-home PATH]
+  codex-provider watch [--codex-home PATH] [--sqlite-home PATH] [--debounce-ms N] [--once] [--no-state-db]
   codex-provider export [archive-path] [--select] [--ids ID[,ID...]] [--overwrite] [--codex-home PATH]
   codex-provider import <archive-path> [--provider ID] [--conflict ask|skip|overwrite|fail] [--dry-run] [--keep N] [--codex-home PATH]
   codex-provider prune-backups [--keep N] [--codex-home PATH]
-  codex-provider restore <backup-dir> [--no-config] [--no-db] [--no-sessions] [--codex-home PATH]
-  codex-provider install-windows-launcher [--dir PATH] [--codex-home PATH]
+  codex-provider restore <backup-dir> [--no-config] [--no-db] [--no-sessions] [--allow-sqlite-home-relocation] [--codex-home PATH] [--sqlite-home PATH]
+  codex-provider install-windows-launcher [--dir PATH] [--codex-home PATH] [--sqlite-home PATH]
+
+switch flags:
+  --model NAME         override root-level model field with NAME (e.g. "MiniMax-M3")
+  --keep-root-model    do not touch the root-level model field; only switch model_provider
+
+watch flags:
+  --codex-home PATH    override CODEX_HOME (default: ~/.codex or $CODEX_HOME)
+  --sqlite-home PATH   override sqlite_home and CODEX_SQLITE_HOME
+  --debounce-ms N      wait N milliseconds after a change before syncing (default 750)
+  --once               exit after the first successful sync
+  --no-state-db        only watch config.toml, ignore SQLite state events
 `);
 }
 
@@ -59,6 +71,7 @@ function summarizeSync(result, label) {
   const lines = [
     `${label} provider: ${result.targetProvider}`,
     `Codex home: ${result.codexHome}`,
+    `SQLite home: ${result.sqliteHome} (source: ${result.sqliteHomeSource})`,
     `Backup: ${result.backupDir}`,
     `Backup creation time: ${formatDuration(result.backupDurationMs ?? 0)}`,
     `Updated rollout files: ${result.changedSessionFiles}`,
@@ -1183,18 +1196,37 @@ async function main() {
 
   if (command === "status") {
     const { getStatus, renderStatus } = await loadService();
-    const status = await getStatus({ codexHome: flags["codex-home"] });
+    const status = await getStatus({
+      codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"]
+    });
     console.log(renderStatus(status));
     return;
   }
 
   if (command === "sync") {
     const { runSync } = await loadService();
+    const { defaultCodexHome } = await import("./constants.js");
+    const { readConfigText, readRootModelFromConfigText } = await import("./config-file.js");
+    const codexHome = path.resolve(
+      flags["codex-home"] ?? process.env.CODEX_HOME ?? defaultCodexHome()
+    );
+    const configPath = path.join(codexHome, "config.toml");
+    let rootModel = null;
+    try {
+      const cfg = await readConfigText(configPath);
+      rootModel = readRootModelFromConfigText(cfg);
+    } catch {
+      // config may be missing in degraded scenarios; carry on without a
+      // model rewrite so the rest of the sync still runs.
+    }
     const result = await runSync({
       codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"],
       provider: flags.provider,
       keepCount: parseKeepCount(flags.keep),
-      onProgress: createSyncProgressReporter()
+      onProgress: createSyncProgressReporter(),
+      model: rootModel
     });
     console.log(summarizeSync(result, "Synchronized"));
     return;
@@ -1205,11 +1237,24 @@ async function main() {
     const provider = positionals[1] ?? flags.provider;
     const result = await runSwitch({
       codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"],
       provider,
+      model: flags.model,
+      keepRootModel: Boolean(flags["keep-root-model"]),
       keepCount: parseKeepCount(flags.keep),
       onProgress: createSyncProgressReporter()
     });
     console.log(summarizeSync(result, "Switched to"));
+    if (result.modelSync) {
+      const { applied, source, model, warning } = result.modelSync;
+      if (applied) {
+        console.log(`Root-level model: ${model} (source: ${source})`);
+      } else if (warning) {
+        console.log(`Root-level model: unchanged (${warning})`);
+      } else {
+        console.log("Root-level model: unchanged (keep-root-model flag set)");
+      }
+    }
     return;
   }
 
@@ -1290,26 +1335,75 @@ async function main() {
     return;
   }
 
+  if (command === "watch") {
+    const { runWatch } = await import("./watch.js");
+    const debounceMs = flags["debounce-ms"] !== undefined
+      ? parseKeepCount(flags["debounce-ms"], { allowZero: true })
+      : undefined;
+    const handle = await runWatch({
+      codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"],
+      debounceMs,
+      includeStateDb: !flags["no-state-db"],
+      once: Boolean(flags.once)
+    });
+    // Race the watcher's own `done` promise (which resolves when
+    // `--once` completes or the consecutive-failure auto-shutdown
+    // fires) against the external SIGINT/SIGTERM handler. Whichever
+    // wins, we stop the watcher cleanly and let the process exit.
+    // Without this race, the CLI sits in the event loop forever
+    // after a `--once` run, because Node only exits on its own
+    // when there are no more pending handles.
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = async (source) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        try {
+          await handle.stop();
+        } catch {
+          // best effort: stop() may already be in flight
+        }
+        resolve(source);
+      };
+      handle.done.then(() => finish("done"), () => finish("done-rejected"));
+      if (handle.signalPromise) {
+        handle.signalPromise.then(() => finish("signal"), () => finish("signal-rejected"));
+      }
+      process.once("SIGINT", () => finish("SIGINT"));
+      process.once("SIGTERM", () => finish("SIGTERM"));
+    });
+    return;
+  }
+
   if (command === "restore") {
     const { runRestore } = await loadService();
     const backupDir = positionals[1] ?? flags.backup;
     const result = await runRestore({
       codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"],
       backupDir,
       restoreConfig: !flags["no-config"],
       restoreDatabase: !flags["no-db"],
-      restoreSessions: !flags["no-sessions"]
+      restoreSessions: !flags["no-sessions"],
+      allowSqliteHomeRelocation: Boolean(flags["allow-sqlite-home-relocation"])
     });
     console.log(`Restored backup from ${path.resolve(backupDir)}`);
     console.log(`Codex home: ${result.codexHome}`);
     console.log(`Provider at backup time: ${result.targetProvider}`);
+    if (result.backupInventoryWarning) {
+      console.log(`Backup inventory warning: ${result.backupInventoryWarning}`);
+    }
     return;
   }
 
   if (command === "install-windows-launcher") {
     const result = await installWindowsLauncher({
       dir: flags.dir,
-      codexHome: flags["codex-home"]
+      codexHome: flags["codex-home"],
+      sqliteHome: flags["sqlite-home"]
     });
     console.log("Installed Windows launcher files:");
     console.log(`  Hidden double-click launcher: ${result.vbsPath}`);
@@ -1319,6 +1413,11 @@ async function main() {
       console.log(`  Fixed CODEX_HOME: ${result.codexHome}`);
     } else {
       console.log("  CODEX_HOME: default current environment / ~/.codex");
+    }
+    if (result.sqliteHome) {
+      console.log(`  Fixed SQLite home: ${result.sqliteHome}`);
+    } else {
+      console.log("  SQLite home: config / environment / Codex default");
     }
     return;
   }

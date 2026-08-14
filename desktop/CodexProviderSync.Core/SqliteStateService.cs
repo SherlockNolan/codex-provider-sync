@@ -1,6 +1,29 @@
+using System.Buffers.Binary;
 using Microsoft.Data.Sqlite;
 
 namespace CodexProviderSync.Core;
+
+public sealed record SqliteFileMetadata(
+    string JournalMode,
+    long PageSize,
+    long UserVersion,
+    long ApplicationId);
+
+public sealed record SqliteOnlineBackupPreservation(
+    bool JournalMode,
+    bool PageSize,
+    bool UserVersion,
+    bool ApplicationId);
+
+public sealed record SqliteOnlineBackupMetadata(
+    SqliteFileMetadata Source,
+    SqliteFileMetadata Backup,
+    SqliteOnlineBackupPreservation Preserved);
+
+public sealed record SqliteOnlineBackupResult(
+    bool DatabasePresent,
+    string? BackupPath,
+    SqliteOnlineBackupMetadata? Metadata);
 
 public sealed class SqliteStateService
 {
@@ -31,23 +54,18 @@ public sealed class SqliteStateService
 
     public IReadOnlyList<StateDbLocation> StateDbCandidates(string codexHome)
     {
-        return
-        [
-            new StateDbLocation(
-                StateDbPath(codexHome),
-                Path.Combine(AppConstants.SqliteDirBasename, AppConstants.DbFileBasename),
-                "sqlite-dir"),
-            new StateDbLocation(
-                LegacyStateDbPath(codexHome),
-                AppConstants.DbFileBasename,
-                "legacy-root")
-        ];
+        return new CodexStorageLayoutService().CreateDefault(codexHome).StateDbCandidates;
     }
 
     public StateDbLocation? DetectStateDb(string codexHome)
     {
+        return DetectStateDb(new CodexStorageLayoutService().CreateDefault(codexHome));
+    }
+
+    public StateDbLocation? DetectStateDb(CodexStorageLayout storage)
+    {
         List<(StateDbLocation Location, int Priority)> existingCandidates = [];
-        IReadOnlyList<StateDbLocation> candidates = StateDbCandidates(codexHome);
+        IReadOnlyList<StateDbLocation> candidates = storage.StateDbCandidates;
         for (int index = 0; index < candidates.Count; index += 1)
         {
             StateDbLocation candidate = candidates[index];
@@ -62,7 +80,7 @@ public sealed class SqliteStateService
             return null;
         }
 
-        long rolloutCount = CountRolloutFiles(codexHome);
+        long rolloutCount = CountRolloutFiles(storage.CodexHome);
         List<StateDbCandidateStats> readableCandidates = [];
         foreach ((StateDbLocation candidate, int priority) in existingCandidates)
         {
@@ -98,9 +116,19 @@ public sealed class SqliteStateService
         return DetectStateDb(codexHome)?.Path;
     }
 
+    public string? ExistingStateDbPath(CodexStorageLayout storage)
+    {
+        return storage.StateDbLocation?.Path ?? DetectStateDb(storage)?.Path;
+    }
+
     public async Task<ProviderCounts?> ReadSqliteProviderCountsAsync(string codexHome)
     {
-        string? dbPath = ExistingStateDbPath(codexHome);
+        return await ReadSqliteProviderCountsAsync(new CodexStorageLayoutService().CreateDefault(codexHome));
+    }
+
+    public async Task<ProviderCounts?> ReadSqliteProviderCountsAsync(CodexStorageLayout storage)
+    {
+        string? dbPath = ExistingStateDbPath(storage);
         if (dbPath is null)
         {
             return null;
@@ -165,7 +193,18 @@ public sealed class SqliteStateService
         IReadOnlyCollection<string>? userEventThreadIds = null,
         IReadOnlyDictionary<string, string>? threadCwdsById = null)
     {
-        string? dbPath = ExistingStateDbPath(codexHome);
+        return await ReadSqliteRepairStatsAsync(
+            new CodexStorageLayoutService().CreateDefault(codexHome),
+            userEventThreadIds,
+            threadCwdsById);
+    }
+
+    public async Task<SqliteRepairStats?> ReadSqliteRepairStatsAsync(
+        CodexStorageLayout storage,
+        IReadOnlyCollection<string>? userEventThreadIds = null,
+        IReadOnlyDictionary<string, string>? threadCwdsById = null)
+    {
+        string? dbPath = ExistingStateDbPath(storage);
         if (dbPath is null)
         {
             return null;
@@ -233,7 +272,14 @@ public sealed class SqliteStateService
 
     public async Task<bool> AssertSqliteWritableAsync(string codexHome, int? busyTimeoutMs = null)
     {
-        string? dbPath = ExistingStateDbPath(codexHome);
+        return await AssertSqliteWritableAsync(
+            new CodexStorageLayoutService().CreateDefault(codexHome),
+            busyTimeoutMs);
+    }
+
+    public async Task<bool> AssertSqliteWritableAsync(CodexStorageLayout storage, int? busyTimeoutMs = null)
+    {
+        string? dbPath = ExistingStateDbPath(storage);
         if (dbPath is null)
         {
             return false;
@@ -244,6 +290,7 @@ public sealed class SqliteStateService
         {
             await connection.OpenAsync();
             await SetBusyTimeoutAsync(connection, busyTimeoutMs);
+            await ConfigureSqliteWriteDurabilityAsync(connection);
             await ExecuteNonQueryAsync(connection, "BEGIN IMMEDIATE");
             await ExecuteNonQueryAsync(connection, "ROLLBACK");
             return true;
@@ -256,23 +303,49 @@ public sealed class SqliteStateService
         }
     }
 
-    public async Task<(int UpdatedRows, int ProviderRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)> UpdateSqliteProviderAsync(
+    public async Task<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)> UpdateSqliteProviderAsync(
         string codexHome,
         string targetProvider,
-        Func<(int UpdatedRows, int ProviderRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent), Task>? afterUpdate = null,
+        string? targetModel = null,
+        Func<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent), Task>? afterUpdate = null,
         int? busyTimeoutMs = null,
         IReadOnlyCollection<string>? userEventThreadIds = null,
-        IReadOnlyDictionary<string, string>? threadCwdsById = null)
+        IReadOnlyDictionary<string, string>? threadCwdsById = null,
+        Action<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)>? onCommitAttempt = null,
+        Func<Task>? afterCommitBeforeAcknowledgement = null)
     {
-        string? dbPath = ExistingStateDbPath(codexHome);
+        return await UpdateSqliteProviderAsync(
+            new CodexStorageLayoutService().CreateDefault(codexHome),
+            targetProvider,
+            targetModel,
+            afterUpdate,
+            busyTimeoutMs,
+            userEventThreadIds,
+            threadCwdsById,
+            onCommitAttempt,
+            afterCommitBeforeAcknowledgement);
+    }
+
+    public async Task<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)> UpdateSqliteProviderAsync(
+        CodexStorageLayout storage,
+        string targetProvider,
+        string? targetModel = null,
+        Func<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent), Task>? afterUpdate = null,
+        int? busyTimeoutMs = null,
+        IReadOnlyCollection<string>? userEventThreadIds = null,
+        IReadOnlyDictionary<string, string>? threadCwdsById = null,
+        Action<(int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent)>? onCommitAttempt = null,
+        Func<Task>? afterCommitBeforeAcknowledgement = null)
+    {
+        string? dbPath = ExistingStateDbPath(storage);
         if (dbPath is null)
         {
             if (afterUpdate is not null)
             {
-                await afterUpdate((0, 0, 0, 0, false));
+                await afterUpdate((0, 0, 0, 0, 0, false));
             }
 
-            return (0, 0, 0, 0, false);
+            return (0, 0, 0, 0, 0, false);
         }
 
         await using SqliteConnection connection = OpenConnection(dbPath, SqliteOpenMode.ReadWriteCreate);
@@ -281,6 +354,7 @@ public sealed class SqliteStateService
         {
             await connection.OpenAsync();
             await SetBusyTimeoutAsync(connection, busyTimeoutMs);
+            await ConfigureSqliteWriteDurabilityAsync(connection);
             await ExecuteNonQueryAsync(connection, "BEGIN IMMEDIATE");
             transactionOpen = true;
 
@@ -292,6 +366,26 @@ public sealed class SqliteStateService
                 """;
             command.Parameters.AddWithValue("$provider", targetProvider);
             int providerRowsUpdated = await command.ExecuteNonQueryAsync();
+
+            // When a target model is provided, align every thread's `model`
+            // column with it alongside `model_provider`. This is what makes
+            // the bottom-right of the Codex UI show the active model for old
+            // sessions, instead of the name that was in effect when each
+            // thread was originally created. The `model` column is only
+            // present in newer Codex schemas, so guard with TableHasColumn
+            // to keep legacy layouts working.
+            int modelRowsUpdated = 0;
+            if (!string.IsNullOrEmpty(targetModel) && await TableHasColumnAsync(connection, "threads", "model"))
+            {
+                await using SqliteCommand modelCommand = connection.CreateCommand();
+                modelCommand.CommandText = """
+                    UPDATE threads
+                    SET model = $model
+                    WHERE COALESCE(model, '') <> $model
+                    """;
+                modelCommand.Parameters.AddWithValue("$model", targetModel);
+                modelRowsUpdated = await modelCommand.ExecuteNonQueryAsync();
+            }
             int userEventRowsUpdated = 0;
             if (userEventThreadIds?.Count > 0 && await TableHasColumnAsync(connection, "threads", "has_user_event"))
             {
@@ -333,16 +427,29 @@ public sealed class SqliteStateService
                 }
             }
 
-            int updatedRows = providerRowsUpdated + userEventRowsUpdated + cwdRowsUpdated;
+            int updatedRows = providerRowsUpdated + modelRowsUpdated + userEventRowsUpdated + cwdRowsUpdated;
 
             if (afterUpdate is not null)
             {
-                await afterUpdate((updatedRows, providerRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true));
+                await afterUpdate((updatedRows, providerRowsUpdated, modelRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true));
             }
 
+            (int UpdatedRows, int ProviderRowsUpdated, int ModelRowsUpdated, int UserEventRowsUpdated, int CwdRowsUpdated, bool DatabasePresent) result =
+                (updatedRows, providerRowsUpdated, modelRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true);
+
+            // Once COMMIT is attempted, an exception no longer proves that
+            // SQLite stayed unchanged: the database may be durable even when
+            // the caller never receives confirmation. Tell the coordinator
+            // immediately before the attempt so it can conservatively restore
+            // the bound backup on any acknowledgement failure.
+            onCommitAttempt?.Invoke(result);
             await ExecuteNonQueryAsync(connection, "COMMIT");
             transactionOpen = false;
-            return (updatedRows, providerRowsUpdated, userEventRowsUpdated, cwdRowsUpdated, true);
+            if (afterCommitBeforeAcknowledgement is not null)
+            {
+                await afterCommitBeforeAcknowledgement();
+            }
+            return result;
         }
         catch (Exception error)
         {
@@ -361,6 +468,252 @@ public sealed class SqliteStateService
             throw WrapSqliteMalformedError(
                 WrapSqliteBusyError(error, "update session provider metadata"),
                 "update session provider metadata");
+        }
+    }
+
+    /// <summary>
+    /// Creates one consistent SQLite main database via SQLite's online-backup
+    /// API. WAL/SHM sidecars are neither copied nor emitted.
+    /// </summary>
+    public async Task<SqliteOnlineBackupResult> CreateSqliteOnlineBackupAsync(
+        CodexStorageLayout storage,
+        string destinationPath,
+        int? busyTimeoutMs = null)
+    {
+        string? dbPath = ExistingStateDbPath(storage);
+        if (dbPath is null)
+        {
+            return new SqliteOnlineBackupResult(false, null, null);
+        }
+
+        string fullSourcePath = Path.GetFullPath(dbPath);
+        string fullDestinationPath = Path.GetFullPath(destinationPath);
+        StringComparison pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(fullSourcePath, fullDestinationPath, pathComparison))
+        {
+            throw new InvalidOperationException(
+                "SQLite online backup destination must differ from the source database.");
+        }
+        if (File.Exists(fullDestinationPath))
+        {
+            throw new IOException("SQLite online backup destination already exists.");
+        }
+        string? destinationDirectory = Path.GetDirectoryName(fullDestinationPath);
+        if (string.IsNullOrEmpty(destinationDirectory))
+        {
+            throw new InvalidOperationException("Cannot resolve SQLite online backup directory.");
+        }
+        Directory.CreateDirectory(destinationDirectory);
+
+        try
+        {
+            SqliteFileMetadata sourceMetadata;
+            await using (SqliteConnection source = OpenConnection(
+                fullSourcePath,
+                SqliteOpenMode.ReadOnly))
+            {
+                await source.OpenAsync();
+                await SetBusyTimeoutAsync(source, busyTimeoutMs);
+                sourceMetadata = await ReadSqliteConnectionMetadataAsync(source);
+                await using SqliteConnection destination = OpenConnection(
+                    fullDestinationPath,
+                    SqliteOpenMode.ReadWriteCreate);
+                await destination.OpenAsync();
+                source.BackupDatabase(destination);
+            }
+
+            await using (FileStream stream = new(
+                fullDestinationPath,
+                FileMode.Open,
+                FileAccess.ReadWrite,
+                FileShare.Read,
+                4096,
+                FileOptions.WriteThrough))
+            {
+                await stream.FlushAsync();
+                stream.Flush(flushToDisk: true);
+            }
+
+            if (File.Exists(fullDestinationPath + "-wal")
+                || File.Exists(fullDestinationPath + "-shm"))
+            {
+                throw new InvalidOperationException(
+                    "SQLite online backup unexpectedly emitted a WAL/SHM sidecar.");
+            }
+
+            SqliteFileMetadata backupMetadata = await ReadStandaloneSqliteHeaderMetadataAsync(
+                fullDestinationPath);
+            SqliteOnlineBackupPreservation preserved = new(
+                sourceMetadata.JournalMode == backupMetadata.JournalMode,
+                sourceMetadata.PageSize == backupMetadata.PageSize,
+                sourceMetadata.UserVersion == backupMetadata.UserVersion,
+                sourceMetadata.ApplicationId == backupMetadata.ApplicationId);
+            return new SqliteOnlineBackupResult(
+                true,
+                fullDestinationPath,
+                new SqliteOnlineBackupMetadata(sourceMetadata, backupMetadata, preserved));
+        }
+        catch (Exception error)
+        {
+            TryDeleteSqliteBackupArtifact(fullDestinationPath);
+            TryDeleteSqliteBackupArtifact(fullDestinationPath + "-wal");
+            TryDeleteSqliteBackupArtifact(fullDestinationPath + "-shm");
+            throw WrapSqliteMalformedError(
+                WrapSqliteBusyError(error, "create a consistent SQLite online backup"),
+                "create a consistent SQLite online backup");
+        }
+    }
+
+    public async Task<SqliteOnlineBackupResult> CreateSqliteOnlineBackupAsync(
+        string codexHome,
+        string destinationPath,
+        int? busyTimeoutMs = null)
+    {
+        return await CreateSqliteOnlineBackupAsync(
+            new CodexStorageLayoutService().CreateDefault(codexHome),
+            destinationPath,
+            busyTimeoutMs);
+    }
+
+    /// <summary>
+    /// Restores a SQLite snapshot into the live database via SQLite's online
+    /// backup API. SQLite owns the destination write transaction, so an
+    /// unfinished restore rolls back without unlinking live WAL/SHM files.
+    /// </summary>
+    public async Task RestoreSqliteOnlineBackupAsync(
+        string sourcePath,
+        string destinationPath,
+        int? busyTimeoutMs = null)
+    {
+        string fullSourcePath = Path.GetFullPath(sourcePath);
+        string fullDestinationPath = Path.GetFullPath(destinationPath);
+        StringComparison pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(fullSourcePath, fullDestinationPath, pathComparison))
+        {
+            throw new InvalidOperationException(
+                "SQLite online restore source must differ from the destination database.");
+        }
+        if (!File.Exists(fullSourcePath))
+        {
+            throw new FileNotFoundException(
+                "SQLite restore source does not exist.",
+                fullSourcePath);
+        }
+
+        string? destinationDirectory = Path.GetDirectoryName(fullDestinationPath);
+        if (string.IsNullOrEmpty(destinationDirectory))
+        {
+            throw new InvalidOperationException("Cannot resolve SQLite online restore directory.");
+        }
+
+        try
+        {
+            // Open and inspect the source before allowing SQLite to touch the
+            // live destination. ReadOnly closes the disappearance race without
+            // ever creating an empty source database.
+            await using SqliteConnection source = OpenConnection(
+                fullSourcePath,
+                SqliteOpenMode.ReadOnly);
+            await source.OpenAsync();
+            await SetBusyTimeoutAsync(source, busyTimeoutMs);
+            _ = await ReadSqliteConnectionMetadataAsync(source);
+
+            Directory.CreateDirectory(destinationDirectory);
+            await using SqliteConnection destination = OpenConnection(
+                fullDestinationPath,
+                SqliteOpenMode.ReadWriteCreate);
+            await destination.OpenAsync();
+            await SetBusyTimeoutAsync(destination, busyTimeoutMs);
+            await ConfigureSqliteWriteDurabilityAsync(destination);
+            source.BackupDatabase(destination);
+        }
+        catch (Exception error)
+        {
+            // Never delete or replace destination artifacts here. SQLite owns
+            // the destination transaction and rolls it back on failure.
+            throw WrapSqliteMalformedError(
+                WrapSqliteBusyError(error, "restore a consistent SQLite online backup"),
+                "restore a consistent SQLite online backup");
+        }
+    }
+
+    internal static async Task<int> ConfigureSqliteWriteDurabilityAsync(
+        SqliteConnection connection)
+    {
+        await ExecuteNonQueryAsync(connection, "PRAGMA synchronous = FULL");
+        object? rawValue = await ExecuteScalarAsync(connection, "PRAGMA synchronous");
+        int synchronous = Convert.ToInt32(rawValue);
+        if (synchronous != 2)
+        {
+            throw new InvalidOperationException(
+                $"Unable to configure SQLite synchronous=FULL (reported {synchronous}).");
+        }
+        return synchronous;
+    }
+
+    private static async Task<SqliteFileMetadata> ReadSqliteConnectionMetadataAsync(
+        SqliteConnection connection)
+    {
+        string journalMode = Convert.ToString(
+            await ExecuteScalarAsync(connection, "PRAGMA journal_mode"))?.ToLowerInvariant() ?? "";
+        long pageSize = Convert.ToInt64(await ExecuteScalarAsync(connection, "PRAGMA page_size"));
+        long userVersion = Convert.ToInt64(await ExecuteScalarAsync(connection, "PRAGMA user_version"));
+        long applicationId = Convert.ToInt64(await ExecuteScalarAsync(connection, "PRAGMA application_id"));
+        return new SqliteFileMetadata(journalMode, pageSize, userVersion, applicationId);
+    }
+
+    private static async Task<SqliteFileMetadata> ReadStandaloneSqliteHeaderMetadataAsync(
+        string dbPath)
+    {
+        byte[] header = new byte[100];
+        await using FileStream stream = new(
+            dbPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            4096,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await stream.ReadExactlyAsync(header);
+        ReadOnlySpan<byte> magic = "SQLite format 3\0"u8;
+        if (!header.AsSpan(0, magic.Length).SequenceEqual(magic))
+        {
+            throw new InvalidOperationException(
+                "SQLite online backup did not produce a valid standalone database header.");
+        }
+        int rawPageSize = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(16, 2));
+        string journalMode = header[18] == 2 && header[19] == 2 ? "wal" : "delete";
+        return new SqliteFileMetadata(
+            journalMode,
+            rawPageSize == 1 ? 65536 : rawPageSize,
+            BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(60, 4)),
+            BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(68, 4)));
+    }
+
+    private static async Task<object?> ExecuteScalarAsync(
+        SqliteConnection connection,
+        string commandText)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = commandText;
+        return await command.ExecuteScalarAsync();
+    }
+
+    private static void TryDeleteSqliteBackupArtifact(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch
+        {
+            // Cleanup must not hide the original backup failure.
         }
     }
 

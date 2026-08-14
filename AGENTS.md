@@ -15,9 +15,27 @@ For normal Windows users, prefer the GUI app when it is available. Use the CLI w
 The tool works by updating both:
 
 - rollout metadata under `~/.codex/sessions` and `~/.codex/archived_sessions`
-- SQLite thread metadata in the detected Codex state database, normally
-  `~/.codex/sqlite/state_5.sqlite` with legacy fallback to
-  `~/.codex/state_5.sqlite`
+- SQLite thread metadata in the resolved Codex state database
+
+## Architecture Direction
+
+`docs/AUTOMATION_DESIGN_NOTES.md` records the experimental 0.x direction.
+It is not a public compatibility contract. No Automation executable, stable
+JSONL protocol, or UI probe is currently shipped.
+
+For Windows GUI work:
+
+- move UI-independent state, validation, and Core request construction into the
+  Application/controller layer incrementally
+- keep Core authoritative for config, rollout, SQLite, backup, restore, and
+  storage-safety behavior
+- keep WinForms handlers focused on presentation and platform interaction
+- preserve observable behavior and add controller tests for each migrated slice
+- prefer controller tests over adding new reflection-based MainForm business tests
+
+Resolve SQLite Home in this order: explicit CLI/GUI override, root `sqlite_home` in `config.toml`, `CODEX_SQLITE_HOME`, then `<codex-home>/sqlite`. Only the default layout may fall back to `<codex-home>/state_5.sqlite`. Never fall back when an explicit/config/environment SQLite Home is missing.
+
+On Windows, `\\wsl.localhost\...` and `\\wsl$\...` SQLite Homes are diagnostic-only. SQLite operations for these paths run inside WSL and use the corresponding Linux path.
 
 Do not solve this by manually editing rollout files only unless the user explicitly asks for manual intervention.
 
@@ -54,6 +72,13 @@ Use `codex-provider switch <provider-id>` when:
 
 - the user wants to change the root `model_provider`
 - the user wants one command to both switch provider and resync history
+
+By default `switch` also aligns the root-level `model` with the new
+provider section's `model`. Use `switch <provider-id> --keep-root-model`
+to leave the root-level `model` untouched, or
+`switch <provider-id> --model <name>` to set it explicitly (e.g. when
+the new provider section has no `model` field of its own, or when the
+user wants to call a non-default model through a relay provider).
 
 Use `codex-provider restore <backup-dir>` when:
 
@@ -95,6 +120,9 @@ GUI mapping:
 - `Execute` with config checkbox = switch-like behavior
 - `Restore Backup` = restore a previous backup
 - backup retention defaults to 5 and can be customized in the GUI
+- SQLite Home overrides are stored per Codex Home in app settings and are passed to refresh, sync, switch, and restore
+- Windows GUI refresh reports WSL UNC SQLite Homes as diagnostic-only paths; Execute and Restore are disabled for that layout
+- restoring a metadata v2 backup to a different SQLite Home requires a second confirmation showing source and target
 - `Clean Old Backups` = prune managed backups down to the selected retention count
 
 ## Important Behavior
@@ -115,10 +143,16 @@ If the output says `state_5.sqlite is currently in use`:
 - tell the user to close Codex, Codex App, and app-server
 - then rerun the same command
 
+If the output says Windows cannot safely access SQLite through a WSL UNC path:
+
+- identify the message as a WSL UNC path safety diagnostic
+- open the corresponding WSL distribution
+- run the CLI there with the Windows Codex Home mounted under `/mnt/<drive>/...` and SQLite Home expressed as a Linux `/home/...` path
+
 If sync reports `Skipped locked rollout files`:
 
 - treat the sync as mostly successful
-- explain that the active session still holds one or more rollout files open
+- explain that an active session either still holds one or more rollout files open, or appended to one while it was being scanned
 - tell the user to rerun `codex-provider sync` after that session ends if they want a full rewrite
 
 If `switch <provider-id>` fails because the provider is missing:
@@ -136,6 +170,9 @@ If `switch <provider-id>` fails because the provider is missing:
 - by default the tool keeps the most recent 5 managed backups
 - use GUI retention settings or CLI `--keep <n>` when the user wants a different retention count
 - do not edit `state_5.sqlite` or rollout files manually if the tool can do it
+- classify WSL UNC messages as path safety diagnostics and route SQLite operations through WSL with Linux paths
+- metadata v2 backups record `sqliteHome` and `sqliteDbFiles`; a missing default-layout database may be rebuilt from a valid backup, but a missing explicit/config/environment database remains an error
+- CLI restore to a different SQLite Home requires `--sqlite-home`, `--allow-sqlite-home-relocation`, and `--no-config`; desktop apps must reject relocation while config restore is selected
 - GUI settings live in `%AppData%\codex-provider-sync\settings.json`
 
 ## Recommended Commands
@@ -146,6 +183,8 @@ codex-provider sync
 codex-provider sync --keep 5
 codex-provider sync --provider openai
 codex-provider switch apigather
+codex-provider switch apigather --model "MiniMax-M3"
+codex-provider switch apigather --keep-root-model
 codex-provider export codex-history.tgz
 codex-provider export --select
 codex-provider export selected-history.tgz --ids thread-a,thread-b
@@ -161,6 +200,13 @@ With an explicit Codex home:
 codex-provider status --codex-home C:\Users\you\.codex
 codex-provider sync --codex-home C:\Users\you\.codex
 codex-provider switch openai --codex-home C:\Users\you\.codex
+```
+
+From WSL when Codex Home is on Windows and SQLite Home is in WSL:
+
+```bash
+codex-provider status --codex-home /mnt/c/Users/you/.codex --sqlite-home /home/you/.codex/sqlite
+codex-provider sync --codex-home /mnt/c/Users/you/.codex --sqlite-home /home/you/.codex/sqlite
 ```
 
 ## One-Shot Prompt Template

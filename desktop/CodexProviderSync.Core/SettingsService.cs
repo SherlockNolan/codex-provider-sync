@@ -61,12 +61,14 @@ public sealed class SettingsService
         {
             RecentCodexHomes = recents,
             LastCodexHome = Path.GetFullPath(codexHome),
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate(settings.SavedProviders).ToList(),
             ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
             LastSelectedProvider = settings.LastSelectedProvider,
             LastBackupDirectory = settings.LastBackupDirectory,
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -77,12 +79,14 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
             LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate([.. settings.SavedProviders, .. providerIds]).ToList(),
             ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
             LastSelectedProvider = settings.LastSelectedProvider,
             LastBackupDirectory = settings.LastBackupDirectory,
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -93,12 +97,14 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
             LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate([.. settings.SavedProviders, providerId]).ToList(),
             ManualProviders = Deduplicate([.. settings.ManualProviders, providerId]).ToList(),
             LastSelectedProvider = providerId,
             LastBackupDirectory = settings.LastBackupDirectory,
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -109,12 +115,14 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
             LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = settings.SavedProviders.Where(provider => !string.Equals(provider, providerId, StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToList(),
             ManualProviders = settings.ManualProviders.Where(provider => !string.Equals(provider, providerId, StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToList(),
             LastSelectedProvider = string.Equals(settings.LastSelectedProvider, providerId, StringComparison.Ordinal) ? null : settings.LastSelectedProvider,
             LastBackupDirectory = settings.LastBackupDirectory,
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -125,12 +133,32 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
             LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate(settings.SavedProviders).ToList(),
             ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
             LastSelectedProvider = settings.LastSelectedProvider,
             LastBackupDirectory = settings.LastBackupDirectory,
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(uiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
+            WindowBounds = settings.WindowBounds
+        };
+    }
+
+    public AppSettings RecordAutomaticUpdateCheck(AppSettings settings, DateOnly date)
+    {
+        return new AppSettings
+        {
+            RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
+            LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
+            SavedProviders = Deduplicate(settings.SavedProviders).ToList(),
+            ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
+            LastSelectedProvider = settings.LastSelectedProvider,
+            LastBackupDirectory = settings.LastBackupDirectory,
+            BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
+            UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = date,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -146,13 +174,56 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes).ToList(),
             LastCodexHome = settings.LastCodexHome,
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate(settings.SavedProviders).ToList(),
             ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
             LastSelectedProvider = string.IsNullOrWhiteSpace(selectedProvider) ? settings.LastSelectedProvider : selectedProvider.Trim(),
             LastBackupDirectory = string.IsNullOrWhiteSpace(backupDirectory) ? settings.LastBackupDirectory : Path.GetFullPath(backupDirectory),
             BackupRetentionCount = NormalizeBackupRetentionCount(backupRetentionCount ?? settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = bounds ?? settings.WindowBounds
+        };
+    }
+
+    public string? GetSqliteHomeOverride(AppSettings settings, string codexHome)
+    {
+        Dictionary<string, string> overrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides);
+        return overrides.TryGetValue(Path.GetFullPath(codexHome), out string? sqliteHome)
+            ? sqliteHome
+            : null;
+    }
+
+    public AppSettings RecordSqliteHomeOverride(
+        AppSettings settings,
+        string codexHome,
+        string? sqliteHome)
+    {
+        Dictionary<string, string> overrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides);
+        string normalizedCodexHome = Path.GetFullPath(codexHome);
+        if (string.IsNullOrWhiteSpace(sqliteHome))
+        {
+            overrides.Remove(normalizedCodexHome);
+        }
+        else
+        {
+            overrides[normalizedCodexHome] = Path.GetFullPath(sqliteHome.Trim());
+        }
+
+        AppSettings normalized = Normalize(settings);
+        return new AppSettings
+        {
+            RecentCodexHomes = normalized.RecentCodexHomes,
+            LastCodexHome = normalized.LastCodexHome,
+            SqliteHomeOverrides = overrides,
+            SavedProviders = normalized.SavedProviders,
+            ManualProviders = normalized.ManualProviders,
+            LastSelectedProvider = normalized.LastSelectedProvider,
+            LastBackupDirectory = normalized.LastBackupDirectory,
+            BackupRetentionCount = normalized.BackupRetentionCount,
+            UiLanguage = normalized.UiLanguage,
+            LastAutomaticUpdateCheckDate = normalized.LastAutomaticUpdateCheckDate,
+            WindowBounds = normalized.WindowBounds
         };
     }
 
@@ -162,12 +233,14 @@ public sealed class SettingsService
         {
             RecentCodexHomes = Deduplicate(settings.RecentCodexHomes.Select(Path.GetFullPath)).Take(10).ToList(),
             LastCodexHome = string.IsNullOrWhiteSpace(settings.LastCodexHome) ? null : Path.GetFullPath(settings.LastCodexHome),
+            SqliteHomeOverrides = NormalizeSqliteHomeOverrides(settings.SqliteHomeOverrides),
             SavedProviders = Deduplicate(settings.SavedProviders).ToList(),
             ManualProviders = Deduplicate(settings.ManualProviders).ToList(),
             LastSelectedProvider = string.IsNullOrWhiteSpace(settings.LastSelectedProvider) ? null : settings.LastSelectedProvider.Trim(),
             LastBackupDirectory = string.IsNullOrWhiteSpace(settings.LastBackupDirectory) ? null : Path.GetFullPath(settings.LastBackupDirectory),
             BackupRetentionCount = NormalizeBackupRetentionCount(settings.BackupRetentionCount),
             UiLanguage = NormalizeUiLanguage(settings.UiLanguage),
+            LastAutomaticUpdateCheckDate = settings.LastAutomaticUpdateCheckDate,
             WindowBounds = settings.WindowBounds
         };
     }
@@ -179,6 +252,21 @@ public sealed class SettingsService
             .Select(static value => value.Trim())
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal);
+    }
+
+    private static Dictionary<string, string> NormalizeSqliteHomeOverrides(
+        IReadOnlyDictionary<string, string>? overrides)
+    {
+        Dictionary<string, string> normalized = new(
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        foreach ((string codexHome, string sqliteHome) in overrides ?? new Dictionary<string, string>())
+        {
+            if (!string.IsNullOrWhiteSpace(codexHome) && !string.IsNullOrWhiteSpace(sqliteHome))
+            {
+                normalized[Path.GetFullPath(codexHome)] = Path.GetFullPath(sqliteHome);
+            }
+        }
+        return normalized;
     }
 
     private static JsonSerializerOptions JsonSerializerOptions()
