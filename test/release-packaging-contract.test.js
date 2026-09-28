@@ -36,8 +36,42 @@ test("release packaging creates a focused Automation ZIP with its protocol and g
 test("publish workflow resolves a tag-bound Chinese announcement instead of hardcoding a body", () => {
   const workflow = read(".github/workflows/publish.yml");
 
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /release_tag:/);
+  assert.match(workflow, /ref: refs\/tags\/\$\{\{ inputs\.release_tag \}\}/);
+  assert.match(workflow, /tag_name: \$\{\{ inputs\.release_tag \}\}/);
+  assert.doesNotMatch(workflow, /\bpush:\s*\n\s+tags:/);
+  assert.doesNotMatch(workflow, /github\.ref_name|GITHUB_REF_NAME/);
   assert.match(workflow, /read-release-metadata\.js --tag/);
   assert.match(workflow, /body_path: \$\{\{ steps\.release_metadata\.outputs\.release_body_path \}\}/);
   assert.match(workflow, /name: \$\{\{ steps\.release_metadata\.outputs\.release_title \}\}/);
   assert.doesNotMatch(workflow, /^\s+body:\s*\|/m);
+});
+
+test("CI requires all four native Electron candidates and their aggregate index", () => {
+  const workflow = read(".github/workflows/ci.yml");
+
+  for (const value of [
+    "windows-x64",
+    "macos-x64",
+    "macos-arm64",
+    "linux-x64",
+    "macos-15-intel",
+    "macos-15",
+    "desktop:pack:candidate",
+    "desktop:stage:candidate",
+    "desktop:smoke:candidate:artifacts",
+    "desktop:verify:candidate:set"
+  ]) assert.match(workflow, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const gate = workflow.slice(workflow.indexOf("  ci-gate:"));
+  assert.match(gate, /- electron-release-candidate/);
+  assert.match(gate, /- electron-candidate-set/);
+  assert.match(gate, /CPS_CI_NEEDS: \$\{\{ toJSON\(needs\) \}\}/);
+  assert.match(gate, /node scripts\/ci-docs\.mjs gate/);
+  assert.match(workflow, /c10-evidence-bundle:/);
+  assert.match(workflow, /CPS_REQUIRED_JOB_RESULTS_JSON: \$\{\{ toJSON\(needs\) \}\}/);
+  assert.match(gate, /- c10-evidence-bundle/);
+  assert.match(workflow, /vnext-c10-evidence-\$\{\{ github\.sha \}\}/);
+  assert.ok((workflow.match(/retention-days: 30/g) || []).length >= 3);
+  assert.match(workflow, /if-no-files-found: error/);
 });

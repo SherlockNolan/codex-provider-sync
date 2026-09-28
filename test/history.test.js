@@ -1,0 +1,512 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import { getHistorySession, listHistory } from "../src/history.js";
+import { openDatabase } from "../src/sqlite.js";
+
+test("history public inputs fail with typed invalid-input errors", async () => {
+  await assert.rejects(
+    () => listHistory("unused", { page: 0 }),
+    (error) => error?.code === "INVALID_INPUT" && /page must/.test(error.message)
+  );
+  await assert.rejects(
+    () => listHistory("unused", { archived: "unknown" }),
+    (error) => error?.code === "INVALID_INPUT" && /archived must/.test(error.message)
+  );
+  await assert.rejects(
+    () => getHistorySession("unused", ""),
+    (error) => error?.code === "INVALID_INPUT" && /sessionId is required/.test(error.message)
+  );
+});
+
+test("history treats a missing Codex Home as an empty page", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-missing-"));
+  const missing = path.join(root, "not-created");
+  try {
+    const result = await listHistory(missing, { page: 1, pageSize: 50 });
+    assert.deepEqual(result, {
+      page: 1,
+      pageSize: 50,
+      total: 0,
+      hasNextPage: false,
+      sessions: []
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+async function fixture() {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-"));
+  const file = path.join(home, "sessions", "2026", "08", "04", "rollout-one.jsonl");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const lines = [
+    { type: "session_meta", timestamp: "2026-08-04T08:00:00.000Z", payload: { id: "thread-one", title: "测试会话", cwd: "/work/demo", model_provider: "openai", model: "gpt-5" } },
+    { type: "event_msg", timestamp: "2026-08-04T08:01:00.000Z", payload: { type: "user_message", message: "请总结这个项目" } },
+    { type: "event_msg", timestamp: "2026-08-04T08:02:00.000Z", payload: { type: "assistant_message", message: "这是项目总结。" } },
+    { type: "response_item", timestamp: "2026-08-04T08:03:00.000Z", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Agent 的详细回答。" }] } },
+    { type: "event_msg", payload: { type: "tool_call", arguments: "secret" } },
+    { type: "event_msg", payload: { encrypted_content: "gAAA" } }
+  ];
+  await fs.writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
+  return { home, file };
+}
+
+async function writeTitleStateDb(dbPath, rows) {
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
+  const db = await openDatabase(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        first_user_message TEXT NOT NULL DEFAULT ''
+      )
+    `);
+    const statement = db.prepare(
+      "INSERT INTO threads (id, title, first_user_message) VALUES (?, ?, ?)"
+    );
+    for (const row of rows) {
+      statement.run(row.id, row.title, row.firstUserMessage ?? "must not become a title");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function trackHistoryReadBytes() {
+  const originalOpen = fs.open;
+  const bytesByPath = new Map();
+  fs.open = async (...args) => {
+    const handle = await originalOpen(...args);
+    const filePath = path.resolve(String(args[0]));
+    const originalRead = handle.read.bind(handle);
+    handle.read = async (...readArgs) => {
+      const result = await originalRead(...readArgs);
+      bytesByPath.set(filePath, (bytesByPath.get(filePath) ?? 0) + result.bytesRead);
+      return result;
+    };
+    return handle;
+  };
+  return {
+    bytesByPath,
+    restore() {
+      fs.open = originalOpen;
+    }
+  };
+}
+
+test("history lists readable sessions and filters message text", async () => {
+  const { home } = await fixture();
+  try {
+    const result = await listHistory(home, { page: 1, pageSize: 50, query: "总结" });
+    assert.equal(result.total, 1);
+    assert.equal(result.sessions[0].id, "thread-one");
+    assert.equal(result.sessions[0].messageCount, 3);
+    assert.equal(result.sessions[0].messageCountKnown, true);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history list without a query reads only bounded rollout metadata", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-metadata-"));
+  const file = path.join(home, "sessions", "rollout-large-body.jsonl");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, [
+    JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-08-04T08:00:00.000Z",
+      payload: { id: "metadata-only", title: "Metadata only", cwd: "/work/metadata", model_provider: "openai" }
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: { type: "assistant_message", message: `private-body-${"x".repeat(2 * 1024 * 1024)}` }
+    })
+  ].join("\n") + "\n", "utf8");
+  const tracker = trackHistoryReadBytes();
+  try {
+    const result = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(result.total, 1);
+    assert.equal(result.sessions[0].id, "metadata-only");
+    assert.equal(result.sessions[0].messageCount, 0);
+    assert.equal(result.sessions[0].messageCountKnown, false);
+    assert.ok((tracker.bytesByPath.get(path.resolve(file)) ?? 0) <= 64 * 1024);
+    assert.doesNotMatch(JSON.stringify(result), /private-body/);
+  } finally {
+    tracker.restore();
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history projects explicit SQLite thread titles without reading message bodies", async () => {
+  const { home } = await fixture();
+  const configuredSqliteHome = path.join(home, "configured-sqlite");
+  const defaultDb = path.join(home, "sqlite", "state_5.sqlite");
+  const configuredDb = path.join(configuredSqliteHome, "state_5.sqlite");
+  try {
+    await fs.writeFile(
+      path.join(home, "config.toml"),
+      `sqlite_home = "${configuredSqliteHome.replaceAll("\\", "\\\\")}"\n`,
+      "utf8"
+    );
+    await writeTitleStateDb(defaultDb, [{
+      id: "thread-one",
+      title: "Wrong default database title",
+      firstUserMessage: "wrong default message body"
+    }]);
+    await writeTitleStateDb(configuredDb, [{
+      id: "thread-one",
+      title: "Saved Codex title",
+      firstUserMessage: "private message body must not be used"
+    }]);
+
+    const list = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(list.sessions[0].title, "Saved Codex title");
+    assert.doesNotMatch(JSON.stringify(list), /private message body|wrong default message body/);
+
+    const detail = await getHistorySession(home, "thread-one");
+    assert.equal(detail.session.title, "Saved Codex title");
+    assert.doesNotMatch(JSON.stringify(detail.session), /private message body/);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history trusted SQLite Home override wins over config and ignores missing title schema", async () => {
+  const { home } = await fixture();
+  const configSqliteHome = path.join(home, "config-sqlite");
+  const profileSqliteHome = path.join(home, "profile-sqlite");
+  try {
+    await fs.writeFile(
+      path.join(home, "config.toml"),
+      `sqlite_home = "${configSqliteHome.replaceAll("\\", "\\\\")}"\n`,
+      "utf8"
+    );
+    await writeTitleStateDb(path.join(configSqliteHome, "state_5.sqlite"), [{
+      id: "thread-one",
+      title: "Config title"
+    }]);
+    await fs.mkdir(profileSqliteHome, { recursive: true });
+    const profileDb = await openDatabase(path.join(profileSqliteHome, "state_5.sqlite"));
+    try {
+      profileDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)");
+      profileDb.prepare("INSERT INTO threads (id, title) VALUES (?, ?)").run("thread-one", "Profile title");
+    } finally {
+      profileDb.close();
+    }
+
+    const overridden = await listHistory(home, {
+      page: 1,
+      pageSize: 50,
+      sqliteHome: profileSqliteHome
+    });
+    assert.equal(overridden.sessions[0].title, "Profile title");
+
+    const noTitleSqliteHome = path.join(home, "no-title");
+    await fs.mkdir(noTitleSqliteHome, { recursive: true });
+    const noTitleColumnDb = await openDatabase(path.join(noTitleSqliteHome, "state_5.sqlite"));
+    try {
+      noTitleColumnDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, first_user_message TEXT)");
+      noTitleColumnDb.prepare("INSERT INTO threads (id, first_user_message) VALUES (?, ?)")
+        .run("thread-one", "must not become a title");
+    } finally {
+      noTitleColumnDb.close();
+    }
+    const noTitleColumn = await listHistory(home, {
+      page: 1,
+      pageSize: 50,
+      sqliteHome: noTitleSqliteHome
+    });
+    assert.equal(noTitleColumn.sessions[0].title, "测试会话");
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history skips an oversized first metadata line without scanning later content", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-oversized-metadata-"));
+  const file = path.join(home, "sessions", "rollout-oversized-metadata.jsonl");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, [
+    JSON.stringify({
+      type: "session_meta",
+      payload: { id: "oversized", title: "x".repeat(64 * 1024), cwd: "/work/oversized", model_provider: "openai" }
+    }),
+    JSON.stringify({ type: "session_meta", payload: { id: "must-not-be-used", cwd: "/work/later", model_provider: "openai" } })
+  ].join("\n") + "\n", "utf8");
+  const tracker = trackHistoryReadBytes();
+  try {
+    const result = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(result.total, 0);
+    assert.ok((tracker.bytesByPath.get(path.resolve(file)) ?? 0) <= (64 * 1024) + 1);
+  } finally {
+    tracker.restore();
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history bounds retained metadata fields even when the first line is within the byte limit", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-bounded-fields-"));
+  const file = path.join(home, "sessions", "rollout-bounded-fields.jsonl");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify({
+    type: "session_meta",
+    timestamp: "t".repeat(129),
+    payload: {
+      id: "i".repeat(513),
+      title: "t".repeat(1025),
+      cwd: "c".repeat((32 * 1024) + 1),
+      model_provider: "p".repeat(513),
+      model: "m".repeat(513)
+    }
+  })}\n`, "utf8");
+  try {
+    const result = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(result.total, 1);
+    assert.match(result.sessions[0].id, /^rollout:/);
+    assert.equal(result.sessions[0].title, "");
+    assert.equal(result.sessions[0].cwd, "");
+    assert.equal(result.sessions[0].provider, "(missing)");
+    assert.equal(result.sessions[0].model, "");
+    assert.equal(result.sessions[0].createdAt, null);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history detail returns only safe messages with a limit", async () => {
+  const { home } = await fixture();
+  try {
+    const result = await getHistorySession(home, "thread-one", { messageLimit: 1 });
+    assert.equal(result.returnedMessageCount, 1);
+    assert.equal(result.truncated, true);
+    assert.equal(result.messages[0].role, "assistant");
+    assert.equal(result.messages[0].text, "Agent 的详细回答。");
+    assert.doesNotMatch(JSON.stringify(result), /encrypted_content|tool_call|secret/);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history prefers canonical user events over response-item bootstrap and duplicate messages", async () => {
+  const { home, file } = await fixture();
+  try {
+    const lines = [
+      { type: "session_meta", timestamp: "2026-08-04T08:00:00.000Z", payload: { id: "thread-one", cwd: "/work/demo", model_provider: "openai" } },
+      { type: "response_item", timestamp: "2026-08-04T08:00:10.000Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "<recommended_plugins>internal bootstrap</recommended_plugins>" }] } },
+      { type: "response_item", timestamp: "2026-08-04T08:01:00.000Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "请检查真实标题" }] } },
+      { type: "event_msg", timestamp: "2026-08-04T08:01:00.000Z", payload: { type: "user_message", message: "请检查真实标题" } },
+      { type: "response_item", timestamp: "2026-08-04T08:02:00.000Z", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "标题已检查。" }] } }
+    ];
+    await fs.writeFile(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+
+    const list = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(list.sessions[0].title, "");
+    assert.equal("firstUserMessage" in list.sessions[0], false);
+    assert.doesNotMatch(JSON.stringify(list), /请检查真实标题|标题已检查/);
+    assert.equal(list.sessions[0].messageCount, 0);
+    assert.equal(list.sessions[0].messageCountKnown, false);
+
+    const detail = await getHistorySession(home, "thread-one");
+    assert.deepEqual(detail.messages.map(({ role, text }) => ({ role, text })), [
+      { role: "user", text: "请检查真实标题" },
+      { role: "assistant", text: "标题已检查。" }
+    ]);
+
+    const legacyLines = [
+      lines[0],
+      { type: "response_item", timestamp: "2026-08-04T08:01:00.000Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "旧格式用户消息" }] } },
+      lines.at(-1)
+    ];
+    await fs.writeFile(file, `${legacyLines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+    const legacy = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(legacy.sessions[0].title, "");
+    assert.equal("firstUserMessage" in legacy.sessions[0], false);
+    assert.equal(legacy.sessions[0].messageCount, 0);
+    assert.equal(legacy.sessions[0].messageCountKnown, false);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history keeps the newest session when rollouts share a thread id", async () => {
+  const { home } = await fixture();
+  try {
+    const archived = path.join(home, "archived_sessions", "2026", "08", "04", "rollout-copy.jsonl");
+    await fs.mkdir(path.dirname(archived), { recursive: true });
+    await fs.writeFile(archived, `${JSON.stringify({ type: "session_meta", payload: { id: "thread-one", title: "新副本", cwd: "/work/demo", model_provider: "openai" } })}\n`, "utf8");
+    const newer = new Date(Date.now() + 1000);
+    await fs.utimes(archived, newer, newer);
+    const result = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(result.total, 1);
+    assert.equal(result.sessions[0].title, "新副本");
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history ignores rollout files that disappear before their content is read", async () => {
+  const { home, file } = await fixture();
+  try {
+    await fs.rm(file);
+    const result = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(result.total, 0);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history exposes a stable bounded id when a session has no thread id", async () => {
+  const { home, file } = await fixture();
+  try {
+    await fs.writeFile(file, `${JSON.stringify({ type: "session_meta", payload: { title: "No thread id", cwd: "/work/demo", model_provider: "openai" } })}\n`, "utf8");
+    const first = await listHistory(home, { page: 1, pageSize: 50 });
+    const second = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(first.total, 1);
+    assert.match(first.sessions[0].id, /^rollout:[A-Za-z0-9_-]{43}$/);
+    assert.equal(first.sessions[0].id, second.sessions[0].id);
+    assert.ok(first.sessions[0].id.length <= 300);
+    assert.equal(first.sessions[0].rolloutPath, path.resolve(file));
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history list aggregates a large rollout while detail retains only its bounded tail", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-large-"));
+  const file = path.join(home, "sessions", "rollout-large.jsonl");
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const records = [{
+    type: "session_meta",
+    timestamp: "2026-08-04T08:00:00.000Z",
+    payload: { id: "thread-large", cwd: "/work/large", model_provider: "openai" }
+  }];
+  for (let index = 0; index < 5_000; index += 1) {
+    records.push({
+      type: "event_msg",
+      timestamp: `2026-08-04T08:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      payload: {
+        type: index % 2 === 0 ? "user_message" : "assistant_message",
+        message: `bounded-message-${index}`
+      }
+    });
+  }
+  await fs.writeFile(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+  try {
+    const page = await listHistory(home, { page: 1, pageSize: 50, query: "bounded-message-4999" });
+    assert.equal(page.total, 1);
+    assert.equal(page.sessions[0].messageCount, 5_000);
+    assert.equal(page.sessions[0].messageCountKnown, true);
+    const detail = await getHistorySession(home, "thread-large", { messageLimit: 10 });
+    assert.equal(detail.returnedMessageCount, 10);
+    assert.equal(detail.truncated, true);
+    assert.equal(detail.messages[0].sequence, 4_991);
+    assert.equal(detail.messages.at(-1).text, "bounded-message-4999");
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history detail reads decoy rollouts as metadata and deep-reads only the selected rollout", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-detail-target-"));
+  const sessions = path.join(home, "sessions");
+  await fs.mkdir(sessions, { recursive: true });
+  const decoys = [];
+  for (let index = 0; index < 3; index += 1) {
+    const decoy = path.join(sessions, `rollout-decoy-${index}.jsonl`);
+    decoys.push(decoy);
+    await fs.writeFile(decoy, [
+      JSON.stringify({ type: "session_meta", payload: { id: `decoy-${index}`, cwd: "/work/decoy", model_provider: "openai" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "assistant_message", message: `decoy-body-${"x".repeat(256 * 1024)}` } })
+    ].join("\n") + "\n", "utf8");
+  }
+  const target = path.join(sessions, "rollout-target.jsonl");
+  await fs.writeFile(target, [
+    JSON.stringify({ type: "session_meta", payload: { id: "selected-target", cwd: "/work/target", model_provider: "openai" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "selected body" } })
+  ].join("\n") + "\n", "utf8");
+  const tracker = trackHistoryReadBytes();
+  try {
+    const result = await getHistorySession(home, "selected-target");
+    assert.equal(result.returnedMessageCount, 1);
+    assert.equal(result.messages[0].text, "selected body");
+    assert.equal(result.session.messageCountKnown, true);
+    for (const decoy of decoys) {
+      assert.ok((tracker.bytesByPath.get(path.resolve(decoy)) ?? 0) <= 64 * 1024);
+    }
+  } finally {
+    tracker.restore();
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history detail rejects a same-mtime file replacement selected after listing", async () => {
+  const { home, file } = await fixture();
+  const replacement = `${file}.replacement`;
+  const displaced = `${file}.displaced`;
+  const originalStat = await fs.stat(file);
+  await fs.writeFile(replacement, [
+    JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-08-04T08:00:00.000Z",
+      payload: { id: "thread-one", cwd: "/work/demo", model_provider: "openai" }
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-04T08:01:00.000Z",
+      payload: { type: "assistant_message", message: "replacement marker must never be returned" }
+    })
+  ].join("\n") + "\n", "utf8");
+  await fs.utimes(replacement, originalStat.atime, originalStat.mtime);
+  const originalOpen = fs.open;
+  let openCount = 0;
+  fs.open = async (...args) => {
+    openCount += 1;
+    if (openCount === 2) {
+      await fs.rename(file, displaced);
+      await fs.rename(replacement, file);
+    }
+    return originalOpen(...args);
+  };
+  try {
+    await assert.rejects(
+      () => getHistorySession(home, "thread-one"),
+      (error) => error?.code === "STALE_STATE"
+        && !String(error?.message).includes("replacement marker")
+    );
+  } finally {
+    fs.open = originalOpen;
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
+test("history ignores a linked sessions root outside the selected Codex Home", async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-root-"));
+  const external = await fs.mkdtemp(path.join(os.tmpdir(), "codex-history-external-"));
+  const rollout = path.join(external, "rollout-external.jsonl");
+  await fs.writeFile(rollout, `${JSON.stringify({
+    type: "session_meta",
+    payload: { id: "external-thread", cwd: "/external", model_provider: "openai" }
+  })}\n`, "utf8");
+  try {
+    try {
+      await fs.symlink(external, path.join(home, "sessions"), process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+        t.skip(`directory link unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    const page = await listHistory(home, { page: 1, pageSize: 50 });
+    assert.equal(page.total, 0);
+    assert.doesNotMatch(JSON.stringify(page), /external-thread|\/external/);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.rm(external, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,438 @@
+import type {
+  DesktopUpdateReason,
+  DesktopUpdateStatus
+} from "../shared/update-types.js";
+import {
+  getDesktopUpdateUnavailableReason
+} from "./update-policy.js";
+import type { CoreRuntimeSupervisor } from "./runtime-supervisor.js";
+import { isUpdateVersion, validateUpdateReminderInput, type DesktopUpdateReminderInput } from "../shared/update-preferences.js";
+
+type UpdaterEvent =
+  | "checking-for-update"
+  | "update-available"
+  | "update-not-available"
+  | "download-progress"
+  | "update-downloaded"
+  | "error";
+
+type UpdaterListener = (value?: unknown) => void;
+
+export interface DesktopUpdaterPort {
+  on(event: UpdaterEvent, listener: UpdaterListener): void;
+  off(event: UpdaterEvent, listener: UpdaterListener): void;
+  checkForUpdates(): Promise<unknown>;
+  downloadUpdate(): Promise<unknown>;
+  quitAndInstall(isSilent?: boolean, isForceRunAfter?: boolean): void;
+}
+
+export interface DesktopUpdateControllerOptions {
+  ignoredVersion?: string | null;
+  saveIgnoredVersion?(version: string | null): Promise<void>;
+  claimStartupCheck?(): Promise<boolean>;
+  runStartupCheck?(check: () => Promise<DesktopUpdateStatus>): Promise<DesktopUpdateStatus>;
+  onStartupUpdateAvailable?(status: DesktopUpdateStatus): Promise<void>;
+  manualUpdates?: {
+    force?: boolean;
+    check(): Promise<{ version: string } | null>;
+    openDownloadPage(): Promise<void>;
+  };
+  onStatus?(status: DesktopUpdateStatus): void;
+  isPackaged: boolean;
+  platform: NodeJS.Platform;
+  arch: string;
+  appVersion: string;
+  releaseAuthorized: boolean;
+  configured: boolean;
+  supervisor: Pick<CoreRuntimeSupervisor, "tryBeginRestartInstall">;
+  beforeInstall?(): Promise<void>;
+  createPort?: () => Promise<DesktopUpdaterPort>;
+  setTimeoutImpl?: typeof setTimeout;
+  clearTimeoutImpl?: typeof clearTimeout;
+}
+
+function safeVersion(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const version = (value as { version?: unknown }).version;
+  if (typeof version !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(version)) {
+    return undefined;
+  }
+  return version;
+}
+
+function safeProgressPercent(value: unknown): number | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const percent = (value as { percent?: unknown }).percent;
+  if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
+  return Math.max(0, Math.min(100, Math.round(percent)));
+}
+
+export async function createProductionUpdaterPort(options: {
+  allowPrerelease: boolean;
+}): Promise<DesktopUpdaterPort> {
+  // electron-updater exposes autoUpdater through a CommonJS getter, not an ESM named export.
+  const { default: updater } = await import("electron-updater");
+  const { autoUpdater } = updater;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.allowPrerelease = options.allowPrerelease;
+  autoUpdater.logger = null;
+  return {
+    on(event, listener) {
+      autoUpdater.on(event, listener);
+    },
+    off(event, listener) {
+      autoUpdater.off(event, listener);
+    },
+    checkForUpdates() {
+      return autoUpdater.checkForUpdates();
+    },
+    downloadUpdate() {
+      return autoUpdater.downloadUpdate();
+    },
+    quitAndInstall(isSilent, isForceRunAfter) {
+      autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+    }
+  };
+}
+
+export class DesktopUpdateController {
+  #ignoredVersion: string | null;
+  readonly #saveIgnoredVersion: DesktopUpdateControllerOptions["saveIgnoredVersion"];
+  #reminderWrite: Promise<void> = Promise.resolve();
+  readonly #claimStartupCheck: DesktopUpdateControllerOptions["claimStartupCheck"];
+  readonly #runStartupCheck: DesktopUpdateControllerOptions["runStartupCheck"];
+  readonly #onStartupUpdateAvailable: DesktopUpdateControllerOptions["onStartupUpdateAvailable"];
+  #startupScheduled = false;
+  readonly #appVersion: string;
+  readonly #manualUpdates: DesktopUpdateControllerOptions["manualUpdates"];
+  readonly #onStatus: DesktopUpdateControllerOptions["onStatus"];
+  readonly #supervisor: Pick<CoreRuntimeSupervisor, "tryBeginRestartInstall">;
+  readonly #beforeInstall: () => Promise<void>;
+  readonly #createPort: () => Promise<DesktopUpdaterPort>;
+  readonly #setTimeout: typeof setTimeout;
+  readonly #clearTimeout: typeof clearTimeout;
+  readonly #unavailableReason: ReturnType<typeof getDesktopUpdateUnavailableReason>;
+  readonly #listeners = new Map<UpdaterEvent, UpdaterListener>();
+  #state: DesktopUpdateStatus["state"];
+  #reason: DesktopUpdateReason | undefined;
+  #version: string | undefined;
+  #progressPercent: number | undefined;
+  #restartPending = false;
+  #releaseFailedInstall: (() => void) | null = null;
+  #port: DesktopUpdaterPort | null = null;
+  #portPromise: Promise<DesktopUpdaterPort> | null = null;
+  #checkPromise: Promise<DesktopUpdateStatus> | null = null;
+  #downloadPromise: Promise<DesktopUpdateStatus> | null = null;
+  #installPromise: Promise<DesktopUpdateStatus> | null = null;
+  #initialCheckTimer: ReturnType<typeof setTimeout> | null = null;
+  #disposed = false;
+
+  constructor(options: DesktopUpdateControllerOptions) {
+    this.#ignoredVersion = isUpdateVersion(options.ignoredVersion) ? options.ignoredVersion : null;
+    this.#saveIgnoredVersion = options.saveIgnoredVersion;
+    this.#claimStartupCheck = options.claimStartupCheck;
+    this.#runStartupCheck = options.runStartupCheck;
+    this.#onStartupUpdateAvailable = options.onStartupUpdateAvailable;
+    this.#appVersion = options.appVersion;
+    this.#onStatus = options.onStatus;
+    this.#supervisor = options.supervisor;
+    this.#beforeInstall = options.beforeInstall ?? (async () => {});
+    this.#createPort = options.createPort ?? (() => createProductionUpdaterPort({
+      allowPrerelease: options.appVersion.includes("-")
+    }));
+    this.#setTimeout = options.setTimeoutImpl ?? setTimeout;
+    this.#clearTimeout = options.clearTimeoutImpl ?? clearTimeout;
+    const unavailable = getDesktopUpdateUnavailableReason(options);
+    this.#manualUpdates = options.manualUpdates && unavailable !== "not-packaged" && unavailable !== "unsupported-target"
+      && (options.manualUpdates.force || unavailable !== null) ? options.manualUpdates : undefined;
+    this.#unavailableReason = this.#manualUpdates ? null : unavailable;
+    this.#state = this.#unavailableReason ? "disabled" : "idle";
+    this.#reason = this.#unavailableReason ?? undefined;
+  }
+
+  get restartPending(): boolean {
+    return this.#restartPending;
+  }
+
+  get status(): DesktopUpdateStatus {
+    const status: DesktopUpdateStatus = {
+      schemaVersion: 2,
+      currentVersion: this.#appVersion,
+      ...(this.#manualUpdates ? { mode: "manual" as const } : {}),
+      state: this.#state,
+      installAllowed: false,
+      ...(this.#reason ? { reason: this.#reason } : {}),
+      ...(this.#version ? { version: this.#version } : {}),
+      ...(this.#version && this.#version === this.#ignoredVersion ? { reminderIgnored: true } : {}),
+      ...(this.#progressPercent !== undefined ? { progressPercent: this.#progressPercent } : {})
+    };
+    if (this.#state !== "downloaded") return status;
+    return { ...status, installAllowed: true };
+  }
+
+  scheduleInitialCheck(delayMs = 5_000): void {
+    if (this.#disposed || this.#unavailableReason || !this.#claimStartupCheck || this.#startupScheduled) return;
+    this.#startupScheduled = true;
+    const timer = this.#setTimeout(() => {
+      if (this.#initialCheckTimer !== timer) return;
+      this.#initialCheckTimer = null;
+      void this.#checkAtStartup();
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    this.#initialCheckTimer = timer;
+  }
+
+  async #checkAtStartup(): Promise<void> {
+    try {
+      if (!await this.#claimStartupCheck?.() || this.#disposed) return;
+      const result = await (this.#runStartupCheck ? this.#runStartupCheck(() => this.check()) : this.check());
+      if (!this.#disposed && result.state === "available" && result.version
+          && this.#state === "available" && this.#version === result.version && this.#ignoredVersion !== result.version) {
+        await this.#onStartupUpdateAvailable?.(result);
+      }
+    } catch {
+      // Startup checks and notification failures never interrupt normal app use.
+    }
+  }
+
+  async check(): Promise<DesktopUpdateStatus> {
+    if (this.#disposed || this.#unavailableReason || this.#restartPending) return this.status;
+    if (this.#checkPromise) return this.#checkPromise;
+    if (this.#state === "downloading" || this.#state === "downloaded" || this.#state === "installing") {
+      return this.status;
+    }
+    const pending = (async () => {
+      this.#state = "checking";
+      this.#reason = undefined;
+      this.#version = undefined;
+      this.#progressPercent = undefined;
+      this.#notify();
+      try {
+        if (this.#manualUpdates) {
+          const release = await this.#manualUpdates.check();
+          this.#version = release?.version;
+          this.#state = release ? "available" : "not-available";
+          this.#notify();
+          return this.status;
+        }
+        const port = await this.#ensurePort();
+        const result = await port.checkForUpdates();
+        if (this.#state === "checking") {
+          const resultVersion = safeVersion(
+            result && typeof result === "object" && !Array.isArray(result)
+              ? (result as { updateInfo?: unknown }).updateInfo
+              : undefined
+          );
+          this.#version = resultVersion;
+          this.#state = resultVersion ? "available" : "not-available";
+          this.#notify();
+        }
+      } catch {
+        this.#fail("check-failed");
+      }
+      return this.status;
+    })();
+    this.#checkPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.#checkPromise === pending) this.#checkPromise = null;
+    }
+  }
+
+  async setReminder(value: DesktopUpdateReminderInput): Promise<DesktopUpdateStatus> {
+    const input = validateUpdateReminderInput(value);
+    const pending = this.#reminderWrite.then(async () => {
+      // A stale UI/dialog cannot mute a different version. Preferences never download/install.
+      if (this.#disposed || !this.#saveIgnoredVersion || this.#version !== input.version
+          || !["available", "downloaded"].includes(this.#state)) throw new Error("Update reminder unavailable.");
+      const ignored = input.ignored ? input.version : null;
+      await this.#saveIgnoredVersion(ignored);
+      this.#ignoredVersion = ignored;
+      this.#notify();
+    });
+    this.#reminderWrite = pending.catch(() => {});
+    await pending;
+    return this.status;
+  }
+
+  async download(): Promise<DesktopUpdateStatus> {
+    if (this.#disposed || this.#restartPending || this.#state !== "available") return this.status;
+    if (this.#downloadPromise) return this.#downloadPromise;
+    const pending = (async () => {
+      this.#state = "downloading";
+      this.#reason = undefined;
+      this.#progressPercent = 0;
+      if (this.#manualUpdates) {
+        // A portable/local build can discover releases but never runs an installer.
+        this.#progressPercent = undefined;
+        this.#notify();
+        try {
+          await this.#manualUpdates.openDownloadPage();
+          this.#state = "available";
+          this.#notify();
+        } catch { this.#fail("download-failed"); }
+        return this.status;
+      }
+      this.#notify();
+      try {
+        const port = await this.#ensurePort();
+        await port.downloadUpdate();
+        if (this.#state === "downloading") {
+          this.#state = "downloaded";
+          this.#progressPercent = 100;
+        }
+      } catch {
+        this.#fail("download-failed");
+      }
+      return this.status;
+    })();
+    this.#downloadPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.#downloadPromise === pending) this.#downloadPromise = null;
+      this.#notify();
+    }
+  }
+
+  async install(): Promise<DesktopUpdateStatus> {
+    if (this.#disposed || this.#manualUpdates || this.#state !== "downloaded") return this.status;
+    if (this.#installPromise) return this.#installPromise;
+    const pending = (async () => {
+      const restartLease = this.#supervisor.tryBeginRestartInstall();
+      this.#restartPending = true;
+      let retainRestartGate = false;
+      try {
+        // Installation is the user's decision. Storage checks and write draining
+        // belong to Core operations / normal shutdown, never update admission.
+        this.#state = "installing";
+        this.#notify();
+        const port = await this.#ensurePort();
+        await this.#beforeInstall();
+        this.#releaseFailedInstall = () => {
+          this.#releaseFailedInstall = null;
+          restartLease?.release();
+          this.#restartPending = false;
+        };
+        port.quitAndInstall(false, true);
+        // electron-updater can report failure by event instead of throwing.
+        retainRestartGate = this.#restartPending && this.#state === "installing";
+      } catch {
+        this.#fail("install-failed");
+      } finally {
+        if (!retainRestartGate) {
+          this.#releaseFailedInstall = null;
+          restartLease?.release();
+          this.#restartPending = false;
+        }
+      }
+      return this.status;
+    })();
+    this.#installPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.#installPromise === pending) this.#installPromise = null;
+      this.#notify();
+    }
+  }
+
+  dispose(): void {
+    this.#disposed = true;
+    if (this.#initialCheckTimer) {
+      this.#clearTimeout(this.#initialCheckTimer);
+      this.#initialCheckTimer = null;
+    }
+    if (this.#port) {
+      for (const [event, listener] of this.#listeners) this.#port.off(event, listener);
+    }
+    this.#listeners.clear();
+  }
+
+  async #ensurePort(): Promise<DesktopUpdaterPort> {
+    if (this.#port) return this.#port;
+    if (!this.#portPromise) {
+      this.#portPromise = this.#createPort().then((port) => {
+        if (this.#disposed) throw new Error("Update controller is disposed.");
+        this.#port = port;
+        this.#bindPort(port);
+        return port;
+      });
+    }
+    try {
+      return await this.#portPromise;
+    } finally {
+      if (!this.#port) this.#portPromise = null;
+    }
+  }
+
+  #bindPort(port: DesktopUpdaterPort): void {
+    const bind = (event: UpdaterEvent, listener: UpdaterListener) => {
+      const publish: UpdaterListener = (value) => { listener(value); this.#notify(); };
+      this.#listeners.set(event, publish);
+      port.on(event, publish);
+    };
+    bind("checking-for-update", () => {
+      if (!this.#restartPending) this.#state = "checking";
+    });
+    bind("update-available", (info) => {
+      if (this.#restartPending) return;
+      const version = safeVersion(info);
+      if (!version) {
+        this.#fail("check-failed");
+        return;
+      }
+      this.#state = "available";
+      this.#reason = undefined;
+      this.#version = version;
+      this.#progressPercent = undefined;
+    });
+    bind("update-not-available", () => {
+      if (this.#restartPending) return;
+      this.#state = "not-available";
+      this.#reason = undefined;
+      this.#version = undefined;
+      this.#progressPercent = undefined;
+    });
+    bind("download-progress", (progress) => {
+      if (this.#state !== "downloading") return;
+      const percent = safeProgressPercent(progress);
+      if (percent !== undefined) this.#progressPercent = percent;
+    });
+    bind("update-downloaded", (info) => {
+      if (this.#restartPending) return;
+      const version = safeVersion(info) ?? this.#version;
+      if (!version) {
+        this.#fail("download-failed");
+        return;
+      }
+      this.#state = "downloaded";
+      this.#reason = undefined;
+      this.#version = version;
+      this.#progressPercent = 100;
+    });
+    bind("error", () => {
+      if (this.#state === "installing" && this.#releaseFailedInstall) {
+        this.#releaseFailedInstall();
+        this.#fail("install-failed");
+        return;
+      }
+      if (this.#restartPending) return;
+      this.#fail(this.#state === "downloading" ? "download-failed" : "check-failed");
+    });
+  }
+
+  #fail(reason: DesktopUpdateReason): void {
+    this.#state = "error";
+    this.#reason = reason;
+    this.#version = undefined;
+    this.#progressPercent = undefined;
+    this.#notify();
+  }
+
+  #notify(): void {
+    if (!this.#disposed) { try { this.#onStatus?.(this.status); } catch {} }
+  }
+}

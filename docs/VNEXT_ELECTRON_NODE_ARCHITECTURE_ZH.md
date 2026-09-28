@@ -1,0 +1,2833 @@
+# codex-provider-sync vNext 成熟架构设计
+
+2026-09-11 补丁：[ADR-0041](adr/0041-stale-home-lock-status-recovery.md) 区分已失效与不可验证 Home 锁；只读不清锁，由正常 Apply 重验回收，保留全部 Provider I/O 和 Restore 约束。不以文档更新代替发布证据。
+
+2026-09-09 当前修复：[ADR-0040](adr/0040-backup-read-races-and-failure-diagnostics.md) 固定备份只读/清理竞态和失败阶段诊断边界；无 Provider 写入策略、恢复校验或 ProgressEvent 变更，不代表已经发布。
+
+2026-09-08 Windows 写入增量：[ADR-0038](adr/0038-windows-cleanup-and-file-update-timing.md) 优化临时文件清理并加入批次级分项计时；保留 Force 回退、既有原地/流式算法、Flush 与时间戳。固定数字聚合走结果/Host 日志，不扩张 ProgressEvent；不代表发布或阶段完成。
+
+2026-09-08 当前 UI 增量：[ADR-0036](adr/0036-sync-performance-guidance-and-log-split-view.md) 加入按需同步提速说明和 Desktop 日志固定视口双栏/窄屏详情切换；仅使用现有结果计数，无新增 Core API、扫描、Fast 模式或写入策略。不代表发布或阶段完成。
+
+2026-09-07 当前实现增量：[ADR-0035](adr/0035-provider-plan-semantic-revisions-and-sync-validation.md) 明确 Sync/Switch 的 Provider 相关 Plan revision、缺失自定义 Provider 的零写入拒绝及 Desktop 日志详情；取代本目标稿对普通 Provider 操作一概绑定文件物理变动的描述。Repair/Restore 与 Provider I/O 原地写入不变量不变，不代表发布或阶段完成。
+
+> **技术路线：Electron + React + TypeScript + Node 单核心**  
+> **文档状态：Accepted / 已确认（架构方向）**  
+> **文档版本：1.1（当前 V1 约束导航修订）**
+> **基线日期：2026-08-17**  
+> **最后修订：2026-09-08**
+> **适用仓库：`Dailin521/codex-provider-sync`**  
+> **目标版本：vNext / 1.0 架构演进**  
+> **配套 ADR：0001～0038；取代范围按各 ADR 明示，导航见 [迁移执行索引](migration/VNEXT_MIGRATION_EXECUTION_INDEX_ZH.md)**
+
+> 本文定义目标架构与分阶段迁移基线，不代表 `main` 已经完成该架构。迁移期间，当前代码、既有测试与已发布兼容合同仍是现状事实；只有达到对应阶段退出条件后，目标实现才能替代旧实现。
+
+**当前开发先读：[Node Core 当前架构与开发约束](architecture/NODE_CORE_ARCHITECTURE_ZH.md)。** 该文映射真实模块、CLI 过渡适配与 Provider 字节读写门禁，本文保留总体路线和历史迁移上下文，不作为新建同名目录/抽象类的要求。ADR-0016 已取代普通写的双层锁、跨文件 journal、自动全量回滚及 Fast/全正文 Sync；ADR-0019 明确直接同步无需二次确认；ADR-0023 固化文档与测试防漂移规则。遇到旧目标、当前实现与合同冲突必须裁决，不能仅因代码已改就追认新行为。
+
+---
+
+## 目录
+
+- [0. 文档目的](#0-文档目的)
+- [1. 架构决策摘要](#1-架构决策摘要)
+- [2. 项目现状与约束](#2-项目现状与约束)
+- [3. 架构目标](#3-架构目标)
+- [4. 架构原则](#4-架构原则)
+- [5. 目标系统架构](#5-目标系统架构)
+- [6. 目标仓库结构](#6-目标仓库结构)
+- [7. 依赖方向](#7-依赖方向)
+- [8. Node Core 设计](#8-node-core-设计)
+- [9. Plan / Revision / Apply 模型](#9-plan--revision--apply-模型)
+- [10. 操作状态机](#10-操作状态机)
+- [11. Core Runtime 消息协议](#11-core-runtime-消息协议)
+- [12. Electron Main 架构](#12-electron-main-架构)
+- [13. Preload 与 IPC 安全边界](#13-preload-与-ipc-安全边界)
+- [14. React 前端架构](#14-react-前端架构)
+- [15. 页面与信息架构](#15-页面与信息架构)
+- [16. 数据与本地存储](#16-数据与本地存储)
+- [17. SQLite 驱动策略](#17-sqlite-驱动策略)
+- [18. 并发、锁和一致性](#18-并发锁和一致性)
+- [19. 错误模型](#19-错误模型)
+- [20. 安全架构](#20-安全架构)
+- [21. 日志、诊断与遥测](#21-日志诊断与遥测)
+- [22. 性能架构](#22-性能架构)
+- [23. CLI 兼容架构](#23-cli-兼容架构)
+- [24. Local Web UI 兼容](#24-local-web-ui-兼容)
+- [25. 构建工具链](#25-构建工具链)
+- [26. 签名、Notarization 与更新](#26-签名notarization-与更新)
+- [27. 测试体系](#27-测试体系)
+- [28. CI 架构](#28-ci-架构)
+- [29. 版本与发布通道](#29-版本与发布通道)
+- [30. 迁移路线](#30-迁移路线)
+- [31. V1 内部 Checkpoint 序列](#31-v1-内部-checkpoint-序列)
+- [32. 风险登记](#32-风险登记)
+- [33. 代码审查门槛](#33-代码审查门槛)
+- [34. AI / Codex 执行规则](#34-ai--codex-执行规则)
+- [35. ADR 清单](#35-adr-清单)
+- [36. Definition of Done](#36-definition-of-done)
+- [37. 最终推荐](#37-最终推荐)
+- [38. 参考依据](#38-参考依据)
+
+---
+
+## 0. 文档目的
+
+本文是 `codex-provider-sync` 下一代架构的正式基线，用于指导：
+
+- 维护者判断后续技术方向；
+- Codex、其他 AI Agent 和贡献者实施重构；
+- Node CLI、Local Web UI、Windows/macOS GUI 向统一产品演进；
+- Windows、macOS、Linux 三个平台的构建、测试与发布；
+- 在不破坏现有用户数据和 CLI 使用方式的前提下，消除 Node/.NET 双核心。
+
+本文不是单纯的 UI 技术选型说明，也不是要求一次性推倒重写。它规定的是：
+
+> **以现有 Node 业务实现为唯一权威核心，新增 Electron 跨平台桌面产品，并通过渐进迁移淘汰重复的 .NET 业务实现。**
+
+---
+
+## 1. 架构决策摘要
+
+### 1.1 最终结论
+
+```text
+桌面产品：Electron
+界面层：React + TypeScript
+样式与组件：Tailwind CSS + shadcn/ui + Radix UI
+唯一业务核心：Node Core
+桌面进程通信：Preload + Typed IPC
+长任务执行：Electron Utility Process 中运行同一 Node Core
+CLI：继续保留现有 Node CLI，并调用同一 Node Core
+Local Web UI：继续保留，逐步复用同一 React 应用层和 Node Core
+应用自身数据库：不引入
+Codex 数据事实源：config.toml / rollout / state_5.sqlite / global state
+```
+
+### 1.2 一句话架构
+
+> React 负责“看见什么、如何交互”，Electron 负责“窗口和桌面能力”，Node Core 负责“所有同步、备份、恢复和数据安全规则”。
+
+### 1.3 核心结构
+
+```mermaid
+flowchart LR
+    User[用户] --> Renderer[React Renderer]
+    Renderer --> Preload[Preload Typed API]
+    Preload --> Main[Electron Main]
+    Main --> Runtime[Node Core Utility Process]
+    Runtime --> Core[唯一 Node Core]
+
+    CLI[Node CLI] --> Core
+    Web[Local Web Server] --> Core
+
+    Core --> Config[config.toml]
+    Core --> Rollout[sessions / archived_sessions]
+    Core --> SQLite[state_5.sqlite]
+    Core --> GlobalState[.codex-global-state.json]
+    Core --> Backups[managed backups]
+```
+
+### 1.4 不再采用的路线
+
+| 路线 | 决策 | 原因 |
+| --- | --- | --- |
+| Tauri + Rust Core | 当前不采用 | 重写高风险核心，会扩大现有用户兼容责任 |
+| Tauri + Node Sidecar | 不采用 | Rust → Sidecar → Node 增加无必要进程与打包复杂度 |
+| Electron + .NET Core | 不采用 | 无法消除双核心 |
+| Node Core + .NET Core 长期并存 | 不采用 | 同一安全逻辑继续重复维护 |
+| Renderer 直接操作文件/SQLite | 禁止 | 绕过备份、锁、事务、回滚和权限边界 |
+| 应用自建会话数据库 | 不采用 | Codex 原始存储才是事实源 |
+
+---
+
+## 2. 项目现状与约束
+
+### 2.1 当前项目已经是正式用户产品
+
+截至 2026-08-17，仓库已有约 3.2k Star 和 140+ Fork。现有用户已经通过以下方式接入：
+
+```bash
+npm install -g @dailin521/codex-provider-sync
+
+codex-provider status
+codex-provider sync
+codex-provider switch <provider-id>
+codex-provider restore <backup-dir>
+codex-provider watch
+codex-provider web
+```
+
+因此，重构必须把以下内容视为正式用户契约：
+
+- npm 包名；
+- `codex-provider` 可执行命令；
+- 命令名称和参数；
+- 默认路径解析；
+- 退出码；
+- 备份目录；
+- 错误语义；
+- `watch` 与 Local Web UI 行为；
+- Node CLI 的自动化使用方式；
+- WSL 和非桌面环境支持。
+
+### 2.2 迁移开始时的实现（2026-08-17 历史上下文）
+
+```mermaid
+flowchart LR
+    Browser[Browser Web UI] --> NodeWeb[Local Node Web Server]
+    NodeCLI[Node CLI] --> NodeCore[Node Service/Core]
+    NodeWeb --> NodeCore
+
+    WinGUI[Windows .NET GUI] --> DotNetApp[.NET Application]
+    MacGUI[macOS .NET GUI] --> DotNetCore[.NET Core]
+    DotNetApp --> DotNetCore
+
+    NodeCore --> Storage[Codex Storage]
+    DotNetCore --> Storage
+```
+
+当前主要问题不是功能不能运行，而是：
+
+1. Node 与 .NET 都理解同一套同步业务；
+2. 同一安全边界需要维护两份；
+3. Windows、macOS、Web、CLI 的版本与能力容易漂移；
+4. React Web UI 已出现巨型 `App.jsx` 和大体量全局 CSS；
+5. 新功能需要在多个入口重复设计；
+6. 发布流水线被 Node/npm 和 .NET GUI 拆成两套世界。
+
+### 2.3 当前 Node Core 的价值
+
+现有 Node 代码已经覆盖普通重写最容易遗漏的边界：
+
+- rollout 流式扫描和流式改写；
+- 等长原地覆盖与临时文件安全替换；
+- 文件快照、大小和 mtime 校验；
+- 活跃 rollout 锁处理；
+- SQLite 识别、事务和 Busy 检测；
+- `node:sqlite` 与 `better-sqlite3` 双驱动；
+- 写入前备份；
+- Restore 专用 transaction journal；
+- Restore 补偿和恢复状态；
+- WSL UNC 安全限制；
+- workspace roots 修复；
+- `encrypted_content` 风险提示；
+- Local Web UI 的配对、Profile Revision 和 Storage Revision；
+- 大量故障注入和回归测试。
+
+因此 Node Core 不是“临时技术债”，而是当前最成熟的行为基线。
+
+---
+
+## 3. 架构目标
+
+### 3.1 必须实现
+
+1. **唯一业务核心**  
+   CLI、Electron、Local Web UI 只调用同一 Node Core。
+
+2. **正式跨平台桌面产品**  
+   支持 Windows、macOS、Linux，用户不需要额外安装 Node.js。
+
+3. **保持现有 CLI 用户兼容**  
+   不因为 GUI 重构破坏 npm、脚本、WSL 和终端用户。
+
+4. **安全优先**  
+   所有写入继续遵循 Plan、确认、锁、备份、事务、验证、恢复。
+
+5. **UI 与业务解耦**  
+   React 不知道如何修改 rollout 或 SQLite。
+
+6. **逐步替代 .NET**  
+   在 Electron 达到行为等价后，再停用 .NET GUI，而不是先删旧实现。
+
+7. **一套 UI 能力模型**  
+   Electron Renderer 和 Local Web UI 尽量复用相同页面、组件、查询和表单逻辑。
+
+8. **可验证迁移**  
+   每个阶段都能通过自动化测试和真实平台构建验收。
+
+### 3.2 明确不做
+
+- 不在本次架构中重写 Rust Core；
+- 不建立新的应用 SQLite 数据库；
+- 不把项目扩展成通用 Provider 账号管理器；
+- 不读写 `auth.json`、Token 或认证凭据；
+- 不在 Renderer 开启 Node Integration；
+- 不把历史消息正文当作日志或遥测数据；
+- 不一次性把所有 JavaScript 改为 TypeScript；
+- 不在首个 Electron 版本同时实现云同步、插件系统和远程控制；
+- 不为追求“目录漂亮”制造一次巨大且难以审查的搬迁 PR。
+
+---
+
+## 4. 架构原则
+
+### 4.1 单一权威核心
+
+V1 当前业务用例位于 `packages/core/src/application`；成熟存储算法仍在根 `src/`，由 Infrastructure 静态接入。HTTP/Electron Utility 使用 CoreFacade，CLI 暂经 `src/public-api.js` / service 适配到同一用例。后续提取不得复制算法或改变字节读写策略；实际模块图以当前 Core 约束为准。
+
+核心业务包括：
+
+- 状态扫描；
+- Provider 对齐判断；
+- 同步计划；
+- Provider 切换；
+- 备份；
+- 恢复；
+- Watch；
+- Storage Layout；
+- 锁；
+- 事务日志；
+- SQLite；
+- rollout；
+- workspace roots。
+
+禁止以下重复：
+
+```text
+Electron IPC Handler 自己写同步流程
+React 页面自己拼修改逻辑
+CLI Command 自己直接修改 SQLite
+Local Web API 自己重新解释业务规则
+```
+
+### 4.2 Codex 原始存储是事实源
+
+```text
+真实状态：Codex 原始文件和 SQLite
+应用状态：缓存、视图、Profile、窗口设置、操作展示
+```
+
+应用不维护自己的 Session 主表，也不把扫描结果长期保存为“真相”。
+
+V1 Status 读取变化与工具运行状态分离，见 [ADR-0033](adr/0033-status-drift-is-not-operation-busy.md)。聊天追加引起的 revision 漂移显示“状态待刷新”，不构造假写操作；最后完整快照保留但未核验，写入仍受门禁限制，不增加轮询。
+
+### 4.3 Plan → Confirm → Apply
+
+Sync、Switch、Repair、Restore 必须分为 Prepare/Apply；下图为预览操作的交互路径。直接同步和 CLI 可在同进程连续 Prepare/Apply，点击直接同步即授权，无二次确认；Prune 按独立受管备份与 Home 锁合同执行。
+
+```text
+读取当前状态
+    ↓
+生成不可变 Plan
+    ↓
+向用户展示影响范围和警告
+    ↓
+用户确认
+    ↓
+重新校验 Revision / Snapshot
+    ↓
+执行写入
+    ↓
+验证与结果报告
+```
+
+### 4.4 Backup First
+
+只有确定存在实际写入目标时才创建覆盖该集合的 UndoBackup（默认保留 2）；noop 不备份。以下实际变更必须先有可恢复备份，Restore 另有恢复前快照：
+
+- `config.toml`；
+- rollout；
+- `state_5.sqlite`；
+- global state；
+- 与恢复相关的元数据。
+
+### 4.5 UI 无本地高权限
+
+Renderer 只能调用明确暴露的能力：
+
+```ts
+window.codexProvider.getStatus()
+window.codexProvider.prepareSync()
+window.codexProvider.applySync()
+window.codexProvider.listBackups()
+```
+
+禁止暴露：
+
+```ts
+window.fs
+window.require
+window.ipcRenderer
+window.exec
+window.sqlite
+```
+
+### 4.6 进程职责清晰
+
+| 层 | 允许做什么 | 禁止做什么 |
+| --- | --- | --- |
+| Renderer | UI、交互、表单、展示、查询状态 | 文件、SQLite、shell、业务规则 |
+| Preload | 最小、类型化、白名单 API | 暴露原始 Electron/Node API |
+| Main | 窗口、生命周期、安全策略、进程监督 | 执行长时间核心业务 |
+| Core Utility Process | 执行 Node Core、进度、取消、Watch | 创建窗口、操作 Renderer |
+| Node Core | 所有业务与数据安全 | 依赖 Electron、DOM、React |
+| CLI Adapter | 参数解析、输出格式、退出码 | 复制核心业务 |
+| Web Adapter | HTTP、配对、DTO 映射 | 复制核心业务 |
+
+### 4.7 渐进迁移
+
+- `main` 始终可发布；
+- 默认按 ADR-0008 使用可独立合入的小型 PR；
+- 经 ADR-0011 明确批准的 V1 例外使用单一 `V1` 分支和一个最终 PR，但 `C0`～`C10` 必须成为不可变、可独立审查和回退的内部 checkpoint；
+- 分支 checkpoint 的验证不等于受保护分支的阶段 Completed，最终合入前 Phase 保持 In Progress/Pending；
+- 旧 CLI 和旧 GUI 在迁移期间继续工作；
+- 新 Electron 先只读，再开放写入；
+- 不使用该例外放宽 Fixture、兼容、发布或 .NET 保留门槛。
+
+---
+
+## 5. 目标系统架构
+
+### 5.1 系统上下文
+
+```mermaid
+flowchart TB
+    User[用户]
+    Codex[Codex CLI / Desktop]
+    GitHub[GitHub Releases]
+
+    subgraph CPS[codex-provider-sync]
+        Desktop[Electron Desktop]
+        CLI[Node CLI]
+        Web[Local Web UI]
+        Core[Node Core]
+    end
+
+    Storage[Codex Home / SQLite Home]
+
+    User --> Desktop
+    User --> CLI
+    User --> Web
+
+    Desktop --> Core
+    CLI --> Core
+    Web --> Core
+
+    Core --> Storage
+    Codex --> Storage
+    Desktop -.检查更新.-> GitHub
+```
+
+### 5.2 Electron 进程结构
+
+```mermaid
+flowchart LR
+    subgraph RendererProcess[Renderer Process]
+        React[React App]
+        Client[Core Client]
+    end
+
+    subgraph PreloadProcess[Preload Isolated World]
+        Bridge[contextBridge API]
+    end
+
+    subgraph MainProcess[Electron Main Process]
+        IPC[IPC Router]
+        Supervisor[Core Runtime Supervisor]
+        Windows[Window / Tray / Update]
+    end
+
+    subgraph UtilityProcess[Electron Utility Process]
+        Host[Core Runtime Host]
+        NodeCore[Node Core]
+    end
+
+    React --> Client
+    Client --> Bridge
+    Bridge --> IPC
+    IPC --> Supervisor
+    Supervisor --> Host
+    Host --> NodeCore
+```
+
+### 5.3 为什么增加 Utility Process
+
+Electron Main Process 是窗口和整个应用的控制中心，不应承担：
+
+- 大量 rollout 扫描；
+- 同步 SQLite 调用；
+- 大文件解析和重写；
+- 备份复制；
+- Watch 长任务；
+- 故障注入和恢复。
+
+因此桌面端推荐把 Node Core 放到 Electron 自带的 `utilityProcess` 中运行。
+
+这不是 Tauri Sidecar，也不是第二套核心：
+
+- 不需要用户安装 Node；
+- 使用 Electron 自带的 Node Runtime；
+- 加载的仍然是同一个 `@cps/core` 包；
+- CLI 可以直接调用同一包；
+- Utility Process 只是执行位置不同。
+
+### 5.4 Utility Process 生命周期
+
+```text
+App Ready
+  ↓
+创建主窗口
+  ↓
+Renderer 首次请求核心能力
+  ↓
+Main 懒启动 Core Utility Process
+  ↓
+握手：协议版本 / 应用版本 / Core 版本
+  ↓
+处理请求、事件和取消
+  ↓
+崩溃时拒绝全部 Pending Request
+  ↓
+下次请求可重启 Runtime
+  ↓
+若存在未解决 Restore Journal，UI 进入 Recovery 状态
+```
+
+核心进程不应为每次请求重新启动，而应在桌面会话中复用一个实例。
+
+---
+
+## 6. 目标仓库结构
+
+### 6.1 最终结构
+
+下图是迁移目标的概念布局，不是当前文件清单。当前四 Storage 端口和独立 RestoreRecovery 的真实路径见 [Core 模块映射](architecture/NODE_CORE_ARCHITECTURE_ZH.md#2-当前依赖与实际文件)，不得为匹配下图重写成熟算法。
+
+```text
+codex-provider-sync/
+├─ apps/
+│  ├─ cli/
+│  │  ├─ src/
+│  │  │  ├─ cli.js
+│  │  │  ├─ commands/
+│  │  │  └─ presenters/
+│  │  └─ package.json
+│  │
+│  ├─ desktop/
+│  │  ├─ src/
+│  │  │  ├─ main/
+│  │  │  │  ├─ app-lifecycle.ts
+│  │  │  │  ├─ windows.ts
+│  │  │  │  ├─ ipc-router.ts
+│  │  │  │  ├─ core-supervisor.ts
+│  │  │  │  ├─ security.ts
+│  │  │  │  ├─ updater.ts
+│  │  │  │  └─ index.ts
+│  │  │  ├─ preload/
+│  │  │  │  ├─ api.ts
+│  │  │  │  └─ index.ts
+│  │  │  ├─ core-runtime/
+│  │  │  │  ├─ host.ts
+│  │  │  │  └─ index.ts
+│  │  │  └─ renderer/
+│  │  │     ├─ main.tsx
+│  │  │     └─ desktop-client.ts
+│  │  ├─ build/
+│  │  │  ├─ icons/
+│  │  │  ├─ entitlements.mac.plist
+│  │  │  └─ installer/
+│  │  ├─ electron.vite.config.ts
+│  │  ├─ electron-builder.yml
+│  │  └─ package.json
+│  │
+│  └─ web/
+│     ├─ src/
+│     │  ├─ main.tsx
+│     │  ├─ http-client.ts
+│     │  └─ server/
+│     │     ├─ index.js
+│     │     ├─ routes/
+│     │     └─ pairing/
+│     └─ package.json
+│
+├─ packages/
+│  ├─ core/
+│  │  ├─ src/
+│  │  │  ├─ application/
+│  │  │  ├─ domain/
+│  │  │  ├─ infrastructure/
+│  │  │  └─ public-api.js
+│  │  └─ package.json
+│  │
+│  ├─ contracts/
+│  │  ├─ src/
+│  │  │  ├─ commands.ts
+│  │  │  ├─ results.ts
+│  │  │  ├─ events.ts
+│  │  │  ├─ errors.ts
+│  │  │  └─ protocol.ts
+│  │  └─ package.json
+│  │
+│  ├─ core-client/
+│  │  ├─ src/
+│  │  │  ├─ client.ts
+│  │  │  ├─ mock-client.ts
+│  │  │  └─ query-keys.ts
+│  │  └─ package.json
+│  │
+│  ├─ app-ui/
+│  │  ├─ src/
+│  │  │  ├─ app/
+│  │  │  ├─ features/
+│  │  │  ├─ components/
+│  │  │  └─ hooks/
+│  │  └─ package.json
+│  │
+│  ├─ design-system/
+│  │  ├─ src/
+│  │  │  ├─ components/
+│  │  │  ├─ tokens/
+│  │  │  └─ styles/
+│  │  └─ package.json
+│  │
+│  └─ test-fixtures/
+│     ├─ standard/
+│     ├─ mixed-provider/
+│     ├─ locked-rollout/
+│     ├─ recovery-required/
+│     └─ ...
+│
+├─ docs/
+│  ├─ architecture/
+│  ├─ adr/
+│  ├─ migration/
+│  └─ user/
+│
+├─ scripts/
+├─ test/
+├─ package.json
+├─ package-lock.json
+└─ AGENTS.md
+```
+
+### 6.2 Workspace 选择
+
+继续使用 **npm workspaces**，不在架构迁移时额外切换 pnpm/yarn。
+
+原因：
+
+- 当前发布体系已经基于 npm；
+- 用户通过 npm 安装 CLI；
+- 减少一次无业务价值的工具链迁移；
+- `package-lock.json` 可继续作为统一依赖锁。
+
+### 6.3 迁移期目录策略
+
+不要第一步就搬全部文件。建议：
+
+```text
+目录批次 A：保留 src/、web/、desktop/ 原位置
+目录批次 B：建立 packages/core 与 apps/desktop 骨架
+目录批次 C：按正式迁移阶段逐个迁移入口
+目录批次 D：Electron 达到正式阶段 6 的稳定条件后，再移动 legacy .NET
+```
+
+目录迁移必须独立于业务行为改动，避免一个 PR 同时包含：
+
+- 大量路径移动；
+- JavaScript → TypeScript；
+- 业务重构；
+- UI 重写；
+- 发布系统重写。
+
+---
+
+## 7. 依赖方向
+
+```mermaid
+flowchart BT
+    Contracts[packages/contracts]
+    Core[packages/core]
+    CoreClient[packages/core-client]
+    Design[packages/design-system]
+    AppUI[packages/app-ui]
+
+    CLI[apps/cli]
+    WebRenderer[apps/web/src/main.tsx]
+    WebServer[apps/web/src/server]
+    DesktopRenderer[desktop/renderer]
+    DesktopPreload[desktop/preload]
+    DesktopMain[desktop/main]
+    CoreRuntime[desktop/core-runtime]
+
+    Core --> Contracts
+    CoreClient --> Contracts
+    AppUI --> CoreClient
+    AppUI --> Design
+
+    CLI --> Core
+    WebRenderer --> AppUI
+    WebServer --> Core
+    DesktopRenderer --> AppUI
+    DesktopPreload --> Contracts
+    DesktopMain --> Contracts
+    CoreRuntime --> Core
+```
+
+### 7.1 禁止依赖
+
+- `core` 禁止依赖 Electron；
+- `core` 禁止依赖 React；
+- `core` 禁止依赖 DOM；
+- `app-ui` 禁止依赖 Electron；
+- `renderer` 禁止依赖 `node:*`；
+- `preload` 禁止依赖业务实现；
+- `main` 禁止导入 Renderer 页面组件；
+- CLI 当前经 `src/public-api.js` 兼容适配层调用同一 Core 用例；新版 Web `/api/core` 和 Electron Utility 使用 CoreFacade 公开入口，禁止深导入用例/Storage。Web 保留的旧兼容路由不应扩张为第二套产品 API，不能据此让新 Renderer 调用 `runSync`。
+
+---
+
+## 8. Node Core 设计
+
+### 8.1 Core 的公开能力
+
+当前稳定方法声明以 [CoreFacade 类型](../packages/core/src/index.d.ts)和 [Contracts DTO](../packages/contracts/src/dto.ts) 为唯一代码定义。下面只列方法，不另维护一份可能失真的接口类型：
+
+```text
+getStatus
+prepareSync / applySync
+prepareSwitch / applySwitch
+prepareRepair / applyRepair
+listBackups / prepareRestore / applyRestore / pruneBackups
+listHistory / getHistorySession
+startWatch / stopWatch / getWatchStatus
+getDiagnostics
+```
+
+### 8.2 Application 层
+
+Application 层表示完整用户操作：
+
+```text
+GetStatus
+PrepareSync
+ApplySync
+PrepareSwitch
+ApplySwitch
+ListBackups
+PrepareRestore
+ApplyRestore
+PruneBackups
+ListHistory
+StartWatch
+```
+
+Application 层负责：
+
+- 编排完整流程；
+- 生成 Plan；
+- 检查 Revision；
+- 调用备份、锁、SQLite、rollout 等基础能力；
+- 返回稳定 Result；
+- 发出进度事件；
+- 统一错误分类。
+
+### 8.3 Domain 层
+
+Domain 层保存稳定概念：
+
+- Provider ID；
+- Storage Profile；
+- Storage Revision；
+- Operation Plan；
+- Backup Metadata；
+- Operation Result；
+- Recovery State；
+- Error Code；
+- Progress Stage；
+- Alignment State。
+
+不应创建庞大的抽象实体或通用 ORM。该项目的 Domain 重点是**安全流程和数据一致性**，不是复杂商业对象。
+
+### 8.4 Infrastructure 层
+
+以下是职责分类示意；当前实现为 Config/Session/StateDb/GlobalState 四个 Storage 端口，以及独立 SqliteTransaction、UndoBackup、RestoreRecovery。transaction-journal 仅供 Restore 与旧格式兼容，不是所有用例的通用依赖。
+
+```text
+infrastructure/
+├─ config/
+├─ rollout/
+├─ sqlite/
+├─ storage-layout/
+├─ global-state/
+├─ backup/
+├─ locking/
+├─ transaction-journal/
+├─ history/
+└─ watch/
+```
+
+Infrastructure 只负责“怎么读写”，不决定“为什么执行同步”。
+
+### 8.5 Core 语言迁移策略
+
+高风险存储继续使用 ESM JavaScript，渐进增加 JSDoc/checkJs；契约和宿主/UI 使用 TypeScript。不宣称现有高风险代码已经全部类型检查。下列历史迁移顺序仅供未来独立提案评估，不是 V1 自动授权的翻译任务。
+
+推荐顺序：
+
+1. 保留现有 ESM JavaScript 行为；
+2. 开启 `checkJs`、JSDoc 类型和 `tsc --noEmit`；
+3. 先迁移纯函数和低风险 DTO；
+4. 再迁移 config、storage layout；
+5. 最后迁移 `session-files`、`backup`、`locking`、`transaction-journal`、`service`；
+6. 每迁移一个模块，先通过原有测试和行为兼容测试；
+7. 编译产物仍然是普通 JavaScript，CLI 用户无需安装 TypeScript。
+
+---
+
+## 9. Plan / Revision / Apply 模型
+
+### 9.1 为什么必须拆分
+
+当前 Web UI 已经具备 Profile Revision、Storage Revision 和配置变更检测。桌面端应把它提升为 Core 的正式能力，而不是只存在于 HTTP Adapter。
+
+### 9.2 Plan 示例
+
+公开 `PlanSummary` 是 schema v1 的不可执行摘要；完整类型见 Contracts，关键字段为：
+
+```text
+schemaVersion / planId / operation / createdAt / expiresAt
+profile: { id, revision }
+storageRevision / configRevision / rolloutRevision / stateDbRevision
+backupRevision（Restore）
+target / impact / warnings / requiresConfirmation
+```
+
+真实路径和写入描述符只保留在可信 Core 内部计划中。Provider Sync 摘要不得为了显示模型/加密内容分布而触发正文扫描；修复目标与诊断属于独立方法。
+
+### 9.3 Apply 前重新校验
+
+`applySync({schemaVersion:1, planId})` 不得盲目信任几秒前的扫描结果，必须重新检查：
+
+- Profile Revision；
+- config 内容 Hash；
+- SQLite Home 来源；
+- 当前选中的 state DB；
+- rollout 大小/mtime/snapshot；
+- Pending Transaction；
+- 进程锁；
+- SQLite 可写性。
+
+若任一绑定状态变化，Apply 返回统一的 Canonical Code：
+
+```text
+STALE_STATE
+```
+
+安全的 `details.reason` 可区分 `profile/config/storage/rollout/state-db`；调用方不得据此绕过重新 Prepare。Plan 超过 TTL 则返回 `PLAN_EXPIRED`。用户必须刷新并再次确认。
+
+### 9.4 Plan 存储
+
+- Core 内部保存完整 Plan；
+- Renderer 只拿到可展示 Summary 和 `planId`；
+- Plan 默认 TTL 为 10 分钟，随机不透明 ID、进程内单次消费；
+- 应用重启后 Plan 失效；
+- 不能把可执行 Plan 长期写入应用数据库；
+- CLI 可以在同一进程中 Prepare 后立即 Apply。
+
+---
+
+## 10. 操作状态机
+
+以下是新普通写（Sync/Switch/Repair）状态；Restore 的独立 journal/补偿状态机见 [ADR-0013](adr/0013-restore-v2-recovery-state-machine.md)。直接同步跳过 UI 等待确认，但仍消费同一 Core Plan。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Preparing
+    Preparing --> AwaitingConfirmation
+    Preparing --> Failed
+
+    AwaitingConfirmation --> Running
+    AwaitingConfirmation --> Cancelled
+    AwaitingConfirmation --> Stale
+
+    Running --> Completed
+    Running --> Partial
+    Running --> Failed: 首次 mutation 前
+    Running --> Cancelled: 首次 mutation 前
+
+    Stale --> Preparing
+    Completed --> Idle
+    Partial --> Idle
+    Failed --> Idle
+```
+
+### 10.1 Result 类型
+
+| Result | 含义 |
+| --- | --- |
+| `completed` | 全部完成或 noop |
+| `partial` | 锁定/变化目标被跳过，或 mutation 后失败；保留备份证据，可重试收敛 |
+| `failed_rolled_back` | 仅 Restore / 旧结果兼容，不由新普通写产生 |
+| `recovery_required` | 仅 Restore / 旧结果兼容；未解决 Restore 也会阻止新普通写开始 |
+| `cancelled` | 在安全取消点停止 |
+| `stale` | Plan 与当前存储不再一致 |
+
+### 10.2 取消规则
+
+取消不是随时强制杀进程：
+
+- 普通写首次 mutation 前接受取消，进入 mutation 后不再接受；不能在部分写入后报告 cancelled；
+- Restore 遵守独立安全取消点，补偿恢复期间不能再次取消；
+- 强制关闭后，普通写不伪造 journal 或声称已经全量回滚，需重新检查/同步或手动恢复；Restore 依耐久 journal 与 hash 恢复。
+
+---
+
+## 11. Core Runtime 消息协议
+
+### 11.1 协议消息
+
+```ts
+export type RuntimeMessage =
+  | RuntimeHello
+  | RuntimeRequest
+  | RuntimeResponse
+  | RuntimeEvent
+  | RuntimeCancel
+  | RuntimeShutdown;
+```
+
+请求：
+
+```json
+{
+  "kind": "request",
+  "protocolVersion": 1,
+  "requestId": "req_123",
+  "method": "prepareSync",
+  "payload": {
+    "profileId": "default"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "kind": "response",
+  "requestId": "req_123",
+  "ok": true,
+  "result": {}
+}
+```
+
+事件：
+
+```json
+{
+  "kind": "event",
+  "operationId": "op_123",
+  "event": {
+    "stage": "create_backup",
+    "status": "start",
+    "progress": 0.35
+  }
+}
+```
+
+### 11.2 Supervisor 职责
+
+Electron Main 中的 `CoreRuntimeSupervisor` 负责：
+
+- 懒启动 Utility Process；
+- 版本握手；
+- requestId / Promise 映射；
+- 超时；
+- 进度转发；
+- 取消；
+- 进程退出处理；
+- 日志收集；
+- 应用退出时的优雅关闭。
+
+### 11.3 Runtime 崩溃
+
+如果 Utility Process 崩溃：
+
+1. 所有 Pending Request 失败为 `CORE_RUNTIME_CRASHED`；
+2. UI 显示明确错误，不伪装成业务失败；
+3. Main 不自动无限重启；
+4. 下一次用户主动重试时最多重启一次；
+5. 重启后第一步检查未解决 Restore journal 和旧普通 journal 兼容信息；
+6. 未解决 Restore 阻止新普通写，进入 Recovery；旧普通 journal 只诊断展示、保留证据，不阻止新 Sync。
+
+---
+
+## 12. Electron Main 架构
+
+### 12.1 Main 负责
+
+- 单实例锁；
+- App 生命周期；
+- BrowserWindow；
+- 窗口状态；
+- Tray（后期）；
+- 自定义协议；
+- 安全策略；
+- IPC Handler；
+- Core Runtime Supervisor；
+- 更新检查；
+- 原生文件选择器；
+- 外部链接白名单；
+- 崩溃与诊断入口。
+
+### 12.2 Main 不负责
+
+- Provider 对齐算法；
+- rollout 扫描；
+- SQLite SQL；
+- 备份格式；
+- Restore 规则；
+- Watch 业务；
+- 历史消息解析。
+
+### 12.3 窗口建议
+
+首版只使用一个主窗口：
+
+```text
+MainWindow
+├─ Overview
+├─ Backups / Restore
+├─ History
+├─ Operation Logs（Desktop capability）
+├─ Profiles
+├─ Advanced（Diagnostics / Repair）
+└─ Settings
+```
+
+避免初版引入多个窗口、悬浮窗和复杂托盘状态。原生确认弹窗只用于：
+
+- 应用退出时仍有关键操作；
+- 更新安装；
+- 极端恢复场景。
+
+普通业务确认使用 React Dialog，便于测试和跨平台一致。
+
+---
+
+## 13. Preload 与 IPC 安全边界
+
+### 13.1 BrowserWindow 必须配置
+
+```ts
+new BrowserWindow({
+  webPreferences: {
+    preload: PRELOAD_PATH,
+    nodeIntegration: false,
+    contextIsolation: true,
+    sandbox: true,
+    webSecurity: true
+  }
+});
+```
+
+### 13.2 Preload 只暴露窄接口
+
+```ts
+contextBridge.exposeInMainWorld("codexProvider", {
+  status: {
+    get: (input) => ipcRenderer.invoke("cps:v1:status:get", input)
+  },
+  sync: {
+    prepare: (input) => ipcRenderer.invoke("cps:v1:sync:prepare", input),
+    apply: (input) => ipcRenderer.invoke("cps:v1:sync:apply", input),
+    cancel: (operationId) => ipcRenderer.invoke("cps:v1:operation:cancel", { operationId })
+  },
+  operation: {
+    subscribe: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on("cps:v1:operation:event", listener);
+      return () => ipcRenderer.removeListener("cps:v1:operation:event", listener);
+    }
+  }
+});
+```
+
+### 13.3 禁止暴露原始 IPC
+
+禁止：
+
+```ts
+contextBridge.exposeInMainWorld("electron", {
+  send: ipcRenderer.send,
+  invoke: ipcRenderer.invoke,
+  on: ipcRenderer.on
+});
+```
+
+### 13.4 IPC Handler 要求
+
+每一个 Handler 都必须：
+
+1. 验证 Sender Frame 来源；
+2. 验证 Payload Schema；
+3. 限制字符串长度和数组数量；
+4. 不接受 Renderer 直接提交任意文件路径写入；
+5. 转换为 Core Command；
+6. 序列化错误；
+7. 记录 operationId，但不记录消息正文和凭据；
+8. 使用异步 IPC，禁止同步 IPC。
+
+---
+
+## 14. React 前端架构
+
+### 14.1 技术栈
+
+| 能力 | 选型 |
+| --- | --- |
+| UI | React + TypeScript |
+| 构建 | Vite / electron-vite |
+| 样式 | Tailwind CSS |
+| 组件 | shadcn/ui + Radix UI |
+| 图标 | Lucide |
+| 查询状态 | TanStack Query |
+| 表单 | React Hook Form |
+| 校验 | Zod |
+| 动画 | Motion，仅用于微交互 |
+| 路由 | React Router Memory Router 或等价实现 |
+| 国际化 | react-i18next 或等价方案 |
+| 单元测试 | Vitest + Testing Library |
+| E2E | Playwright Electron |
+
+### 14.2 UI 目录
+
+```text
+packages/app-ui/src/
+├─ app/
+│  ├─ App.tsx
+│  ├─ AppProviders.tsx
+│  ├─ AppRouter.tsx
+│  └─ ErrorBoundary.tsx
+│
+├─ features/
+│  ├─ overview/
+│  ├─ sync/
+│  ├─ switch-provider/
+│  ├─ backups-restore/
+│  ├─ history/
+│  ├─ profiles/
+│  ├─ diagnostics/
+│  └─ settings/
+│
+├─ components/
+│  ├─ layout/
+│  ├─ feedback/
+│  └─ operation/
+│
+├─ hooks/
+├─ i18n/
+└─ index.ts
+```
+
+### 14.3 防止巨型 App
+
+`App.tsx` 只负责：
+
+- 全局 Provider；
+- 主布局；
+- Router；
+- Error Boundary；
+- 全局 Toast；
+- 更新提示。
+
+以下内容禁止写入 `App.tsx`：
+
+- Sync 表单；
+- Status 数据转换；
+- Restore 流程；
+- History 解析；
+- IPC 调用细节；
+- 大量 Dialog；
+- 页面专属状态。
+
+### 14.4 状态归属
+
+| 状态 | 存放位置 |
+| --- | --- |
+| Core Status、Backups、History 列表摘要 | TanStack Query，无后台轮询 |
+| History 正文 | 详情局部生命周期，离页清空，不持久缓存 |
+| Sync/Restore Mutation | TanStack Mutation |
+| Input、Provider 配置 | React Hook Form |
+| Dialog 开关 | 页面局部状态 |
+| 主题、语言 | Settings Store |
+| 当前 Operation | Operation Provider |
+| Core Client | React Context / Dependency Injection |
+| Codex 原始数据 | 不进入长期全局 Store |
+
+不建议默认引入 Redux。只有出现复杂可回放全局状态后再评估。
+
+### 14.5 Core Client 抽象
+
+当前接口与生命周期回调以 [packages/core-client/src/client.ts](../packages/core-client/src/client.ts) 为准，方法语义与 CoreFacade 对齐。Apply 返回终态 `OperationResult`；请求关联、进度和取消通过客户端生命周期处理，不能从旧示例恢复一个只有 `OperationAccepted` 的平行 API。Bridge 订阅属于 transport，不等同于 UI 的公开 CoreClient 方法。
+
+实现：
+
+```text
+DesktopCoreClient → window.codexProvider / Electron IPC
+HttpCoreClient    → Local Web API
+MockCoreClient    → Story / Test / UI 开发
+```
+
+因此页面不能直接调用：
+
+```ts
+window.codexProvider...
+fetch('/api/...')
+```
+
+页面只能调用 `CoreClient`。
+
+### 14.6 Design System
+
+Design System 至少定义：
+
+- 色彩 Token；
+- 字号；
+- 间距；
+- 圆角；
+- 阴影；
+- 状态色；
+- Focus Ring；
+- Dark/Light Theme；
+- Reduced Motion；
+- 状态 Badge；
+- 危险操作组件；
+- Progress Stage；
+- Empty/Error/Recovery 页面。
+
+Provider、Backup、Warning 等不能在每个页面自行设计不同样式。
+
+### 14.7 可访问性
+
+- 所有操作支持键盘；
+- Dialog 正确管理焦点；
+- Status 不只依赖颜色；
+- Progress 使用可读文本；
+- 支持系统 Reduced Motion；
+- 最小点击目标；
+- 表单错误关联 Label；
+- 图标按钮有 `aria-label`；
+- macOS 和 Windows 快捷键文案按平台变化。
+
+---
+
+## 15. 页面与信息架构
+
+### 15.1 Overview
+
+显示：
+
+- 当前 Provider；
+- 当前 model；
+- Codex Home；
+- SQLite Home 与来源；
+- rollout / SQLite Provider 分布；
+- 是否对齐；
+- 锁定文件；
+- Pending Transaction；
+- 最近备份；
+- 当前 Profile 与 Codex/SQLite Home 来源；
+- 主要动作：刷新、预览同步/直接同步、单独切换 Provider、管理存储位置；“单独切换”仍在修改 config 后执行 Provider 同步。
+
+Sync 与 Switch 共用 Overview，不占独立导航页；预览操作走 Prepare → PlanReview → Apply，直接同步走 Prepare → Apply。按 [ADR-0027](adr/0027-unified-backup-retention.md)，备份保留数默认 `2`，仅在“备份与恢复”设置；Overview 只读展示，Sync/Switch/Repair/Watch 共用已保存规则，不能新增操作级数量表单。各 Codex Home 仍使用各自受管备份池，Restore 的受保护恢复证据不受强制数量上限约束。
+
+Desktop 概览必须显示同一完整状态快照中实际使用的 Codex Home、SQLite Home 和选中的数据库文件完整路径（无 DB 时明确提示）。[ADR-0017](adr/0017-local-storage-display-and-saved-history-titles.md) 允许可信 Utility 构造选项提供只读 `displayPaths`；Web 默认仍只显示来源。路径不作为任何写入请求参数，也不进入日志/诊断包。
+
+### 15.2 Overview 内的 Sync
+
+提供“预览同步”和“直接同步”两个按钮，默认保留 2 份备份。直接同步的点击即为执行授权，内部仍连续 Prepare → Apply（同一 planId），但不再弹确认页；展示检查/执行进度和结果，复用锁、revision 检查、备份、取消和 partial 语义。不会执行高级修复。
+
+预览同步流程：
+
+```text
+选择 Profile
+  ↓
+读取 Status
+  ↓
+生成 Sync Plan
+  ↓
+展示影响范围和警告
+  ↓
+用户确认
+  ↓
+实时进度
+  ↓
+结果 + 备份位置 + 跳过文件
+```
+
+### 15.3 Overview 内的 Switch Provider
+
+- 只展示 `config.toml` 中已配置 Provider 和内置 `openai`；
+- 明确根模型三种策略：采用 Provider 配置模型（未配置则保留）、Keep Root Model、显式指定；不在线查询模型，不同步历史模型；
+- 未定义自定义 Provider 时不允许隐式创建；
+- 先生成 Switch Plan。
+
+### 15.4 Backups / Restore
+
+- 列出托管备份；
+- 显示 Provider、创建时间、覆盖内容、大小和恢复能力；
+- Restore 前生成恢复计划；
+- 跨 SQLite Home 恢复需要额外确认；
+- Recovery Required 时该页面优先级最高。
+
+### 15.5 History
+
+- 只读；
+- 默认不加载消息正文；
+- 分页；
+- 不写入日志；
+- 用户主动打开具体会话后才读取；
+- 不提供导出全部历史的首版能力。
+- 宽屏为左侧紧凑会话列表、右侧网页版式消息流；窄屏/200% 缩放退化为列表与详情单页切换；
+- 左栏使用 Core 项目视图：先建立项目与明确父子关系，再按项目主会话分页；子任务默认折叠，缺父/循环记录在“未关联子任务”显式展开。优先读取已保存工作区及名称，未匹配的 cwd 标记为工作目录；不猜项目。每项目独立“加载更多”，会话行操作收进右键菜单（含 Shift+F10），项目显示名仅存本地偏好；详见 [ADR-0022](adr/0022-history-project-roots-and-child-pagination.md)；
+- History限于当前视口，左右栏各自滚动，详情标题与列表分页不随正文滚动；展开信息不得撑高整页。窄屏详情收起列表搜索区并提供返回/刷新，低高度控件区独立滚动，其他页面不改变滚动方式；
+- 用户消息为右侧气泡，Assistant 使用 Markdown、代码块与复制按钮；
+- 详情最多返回最近 200 条并显示截断提示；搜索只在 Enter/按钮提交后运行，列表和详情只手动刷新；
+- 标题依次读取当前 Codex Home 的 `session_index.jsonl` 最新有效 `thread_name`、当前 SQLite 的 `threads.title`、显式 `session_meta.title/name`；全部缺失时才显示“未命名会话”。已保存名称过长时截短，不丢弃；不通过扫描消息正文生成标题，详见 ADR-0017。
+- 空标题显示补充：确认的子代理显示“子任务 · 名称”；没有子任务名的显示“无标题会话 · 日期时间 · ID末8位”。此为展示标签而非保存标题，全部记录保留，不回写原始数据，详见 ADR-0017。
+
+History 用户操作补充见 [ADR-0018](adr/0018-history-session-actions.md)：复制真实 ID/继续命令、会话信息和可信桌面文件定位、明确父关系跳转、全部/主会话/子任务筛选，以及默认 metadata 与显式正文搜索范围；不后台刷新、不执行继续命令、不增加持久化正文索引。
+
+Desktop复制由Host窄IPC调用Main原生剪贴板，仅写入用户点击复制的文本，无读取能力、不写日志；Web仍走浏览器接口。64KiB限制和失败反馈见ADR-0018补充。
+
+### 15.6 Profiles
+
+Profile 保存：
+
+```ts
+interface StorageProfile {
+  id: string;
+  name: string;
+  codexHome: string;
+  sqliteHome?: string;
+  revision: string;
+}
+```
+
+- 路径由 Main 原生文件/目录选择器选择；
+- Renderer 只接收短时、单次消费的选择 token 和目录显示名，不能提交任意路径字符串；
+- 默认 Profile 由启动环境管理，不可编辑或删除；具名 Profile 的 ID 由 Main 自动生成；
+- Codex Home 必选，SQLite Home 可留空并继续按 config → 环境变量 → 默认目录解析；
+- 修改 Profile 后递增 Revision；
+- 操作必须绑定 Profile Revision。
+
+### 15.8 Operation Logs（Desktop capability）
+
+- 初始加载和手动刷新，无后台轮询；当前操作只复用既有 operation push；
+- 按 Profile、操作类型、结果筛选，详情显示处理耗时、完整墙钟耗时与阶段时间线；
+- Prepare/Apply 合并为一条，等待确认计入墙钟但不计入处理耗时；关闭计划为 `dismissed`，重启遗留活动记录为 `interrupted`；
+- requestId、planId、operationId、backupId 可复制；正文、凭据和真实路径不进入日志。
+
+### 15.7 高级功能（Diagnostics / Repair）
+
+[ADR-0034](adr/0034-repair-preview-counts-and-single-diagnostic-scan.md) 固化修复预览的字段累计、分类、去重会话和工作区设置类别口径；全局修复不开放局部选择但保留只读明细。Diagnostics 每次最多一次完整事实扫描，前后 rollout stat 核验，不因漂移重扫或缓存为完整 Status；漂移保留本轮结果并明确未完整。独立有界历史完整性检查和 Plan/Apply 核验不变。
+
+- Core / Electron / App 版本；
+- OS 和架构；
+- 选中的 SQLite 驱动；
+- 路径诊断；
+- Pending Journal；
+- 打包模式；
+- 日志目录；
+- 生成脱敏诊断包。
+
+Diagnostics 仅在用户主动触发时执行一次完整只读扫描，不后台刷新。ProviderSync 固定为首行 Provider-only；需要修改模型、cwd、user-event 或 workspace roots 时，用户在 Diagnostics 页面显式选择 Repair target 并经 Prepare/Confirm/Apply 执行。加密内容只报告计数，不提供修改。
+
+检查结果必须区分可选元数据差异与数据损坏：模型与根模型不同不等于错误；工作区按待调整设置项（含备份）计数；加密字段文件数只是兼容性提示，不表示无法解密或聊天损坏。
+
+按 [ADR-0019](adr/0019-everyday-sync-and-advanced-repair.md)，页面面向用户命名为“高级功能”，内部 `diagnostics` route 与 CLI/Core 方法不变。完整诊断与默认折叠、无默认选中项的专项修复分区展示；进入页面、普通Sync失败或诊断结果均不得自动触发修复。日常Sync/Switch只处理Provider及明确的config根模型策略，不扫描/修复会话序号或重建Codex历史显示索引；后两者是尚未实现的独立高级能力，不能借用当前Repair按钮宣称支持。
+
+---
+
+## 16. 数据与本地存储
+
+### 16.1 不建立应用数据库
+
+应用自身只需要轻量配置文件：
+
+```text
+Electron userData/
+├─ settings.json
+├─ profiles.json
+├─ window-state.json
+├─ logs/
+└─ diagnostics/
+```
+
+建议复用现有原子写入能力：
+
+```text
+write temp
+fsync
+rename
+```
+
+### 16.2 数据分类
+
+| 数据 | 事实源 | 是否持久化到应用目录 |
+| --- | --- | --- |
+| 当前 Provider | `config.toml` | 否 |
+| Session Provider | rollout / SQLite | 否 |
+| Session 内容 | rollout | 否 |
+| Backup | Codex Home managed backup | 否 |
+| Profile | 应用设置 | 是 |
+| Theme / Language | 应用设置 | 是 |
+| Window Position | 应用设置 | 是 |
+| Status Snapshot | Core 实时读取 | 仅内存缓存 |
+| Operation Plan | Core Runtime | 短期内存 |
+| Restore recovery journal / 旧普通 journal 证据 | Codex Home 受管恢复/备份目录 | 否，不存到应用设置目录；在 Home 耐久保存 |
+| Desktop Operation Log | Electron userData | 是，结构化脱敏元数据 |
+
+普通 Sync/Switch/Repair 不创建跨文件持久 journal，mutation 后故障通过 UndoBackup + partial/retry 收敛。旧普通 journal 仅兼容读取；Restore 独立保留 journal、恢复快照与补偿，不能与 Desktop 操作日志混为一谈。
+
+### 16.3 Settings Schema Version
+
+```json
+{
+  "schemaVersion": 1,
+  "theme": "system",
+  "language": "zh-CN",
+  "updateChannel": "stable",
+  "lastProfileId": "default"
+}
+```
+
+配置迁移必须是单向、小步骤、可测试的。
+
+---
+
+## 17. SQLite 驱动策略
+
+当前 Core 已支持：
+
+```text
+优先 node:sqlite
+回退 better-sqlite3
+```
+
+保持该抽象。
+
+### 17.1 CLI
+
+- 现代 Node 优先使用 `node:sqlite`；
+- 旧 Node 使用可选 `better-sqlite3`；
+- npm 安装方式保持兼容；
+- 缺少可用驱动时给出明确错误。
+
+### 17.2 Electron
+
+- Electron 自带 Node Runtime；
+- 构建时检测 `node:sqlite` 能力；
+- 若打包 `better-sqlite3`，必须针对 Electron ABI 重编译；
+- native module 放入 `asarUnpack`；
+- Windows x64、macOS x64/arm64、Linux x64 都运行 packaged smoke test；
+- 每次 Electron Major 升级都执行 SQLite 驱动矩阵测试。
+
+C6/Phase 3 先以 Windows、macOS、Linux host-native runner 的 `electron-builder --dir` unpacked app 闭合只读启动、握手、真实 SQLite 与 Renderer 隔离；本节完整 Windows x64、macOS x64/arm64、Linux x64 packaged/native-driver 矩阵仍是 C9 发布工程门槛。两层证据不可互相替代。
+
+### 17.3 不使用 ORM
+
+项目只操作少量明确的 Codex 表和字段。继续使用显式 SQL：
+
+- 更容易审查；
+- 更容易控制事务；
+- 不产生 Schema Migration 幻觉；
+- 不把 Codex 的数据库误认为应用自己的数据模型。
+
+---
+
+## 18. 并发、锁和一致性
+
+### 18.1 进程内协调
+
+Core Runtime 使用 `OperationCoordinator`：
+
+- 同一个 Codex Home 同时只允许一个写操作；
+- 人工写操作冲突立即返回 Busy，不排队；
+- 写入期间状态读取返回最后完整快照并标记 operation，不扫描中间态冒充健康；
+- Watch 触发的同步不能抢占用户主动操作；
+- Restore 优先于普通 Sync；
+- Recovery Required 时禁止 Sync、Switch、Watch 自动同步等普通业务写；允许执行 recovery-safe 的 Prune，但不得删除任何 Pending Journal 引用的备份。
+
+### 18.2 跨进程锁
+
+同一 Codex Home 的所有正式入口必须遵守 `<CodexHome>/tmp/provider-sync.lock` 跨进程合同。按 [ADR-0016](adr/0016-node-core-responsibility-boundaries-and-lightweight-writes.md)，新 Node Sync/Switch/Repair/Restore 不再获取 State DB resource lock；不同 Home 共用数据库时由 SQLite 原生事务串行化或返回 busy。ADR-0012 只保留为历史决策和旧证据：
+
+```text
+CLI、Web UI、Electron、旧 GUI 同时运行
+        ↓
+Home lock 保证同一 Codex Home 不会并行写入
+SQLite transaction 裁决跨 Home 的共享数据库竞争
+```
+
+V1/C3 必须测试 Home lock 的路径、持有周期和冲突语义，以及共享 SQLite Home 的原生事务结果与重复执行收敛。任何入口都不能依赖 UI 层互相避让。
+
+Electron 的 UI 禁用按钮只是体验优化，不能替代 Core Lock。
+
+### 18.3 状态读取一致性
+
+Status 应返回：
+
+- `snapshotAt`；
+- `storageRevision`；
+- `operationInProgress`；
+- `pendingRecovery`；
+- `sessionActivity`（当前 Home writer owners 的仅展示观察）；
+- `rolloutScanComplete`；
+- `lockedRolloutFiles`。
+
+`sessionActivity` 仅包含 `{state,count}`，计入已对齐、等待输入及子会话；未知不能报零，不等于正在生成回复的数量，也不是本次写入受阻目标数。它不参与写入准入或 revision；Apply 仍按原路径检查写入占用，见 ADR-0030。
+
+UI 不应把部分扫描结果展示成“完全正常”。读取漂移/失败以 `statusReadBlocked` 与未完整快照单独提示，不伪造 `operationInProgress`；状态读取最多一次受限重试，见 ADR-0033。
+
+---
+
+## 19. 错误模型
+
+### 19.1 稳定错误 DTO
+
+```ts
+interface CoreErrorDto {
+  code: CoreErrorCode;
+  message: string;
+  severity: "info" | "warning" | "error" | "fatal";
+  retryable: boolean;
+  recoveryRequired: boolean;
+  operationId?: string;
+  details?: Record<string, unknown>;
+}
+```
+
+### 19.2 关键错误码
+
+```text
+INVALID_INPUT
+PROFILE_CHANGED
+STORAGE_CHANGED
+STALE_STATE
+PLAN_EXPIRED
+CODEX_HOME_NOT_FOUND
+STATE_DB_NOT_FOUND
+SQLITE_UNSUPPORTED_PATH
+SQLITE_BUSY
+SQLITE_UNREADABLE
+ROLLOUT_LOCKED
+ROLLOUT_CHANGED
+PENDING_TRANSACTION
+BACKUP_FAILED
+SYNC_FAILED_ROLLED_BACK
+RECOVERY_REQUIRED
+RESTORE_VALIDATION_FAILED
+PERMISSION_DENIED
+OPERATION_BUSY
+LOCK_UNVERIFIABLE
+OPERATION_CANCELLED
+CORE_RUNTIME_CRASHED
+PROTOCOL_VERSION_MISMATCH
+INTERNAL_ERROR
+```
+
+### 19.3 Renderer 展示规则
+
+- 不根据英文 message 判断错误类型；
+- 根据 `code` 决定页面和动作；
+- `message` 用于详细说明；
+- `RECOVERY_REQUIRED` 必须全局阻断普通写入；
+- `SQLITE_BUSY` 明确提示关闭 Codex/App Server；
+- `ROLLOUT_LOCKED` 显示为 Partial，不假装完全失败。
+
+---
+
+## 20. 安全架构
+
+### 20.1 Electron 安全基线
+
+必须满足：
+
+- `nodeIntegration: false`；
+- `contextIsolation: true`；
+- `sandbox: true`；
+- `webSecurity: true`；
+- 只加载本地打包内容；
+- 严格 CSP；
+- 禁止任意导航；
+- 禁止任意新窗口；
+- 权限请求默认拒绝；
+- 外部链接白名单；
+- 校验 IPC Sender；
+- 不使用 `@electron/remote`；
+- 不暴露原始 `ipcRenderer`；
+- Electron 保持在官方支持版本线内。
+
+### 20.2 自定义协议
+
+生产环境使用类似：
+
+```text
+cps-app://index.html
+```
+
+而不是直接依赖 `file://`。
+
+开发环境可加载 Vite Dev Server，但仅在开发构建启用。
+
+### 20.3 CSP 建议
+
+```text
+default-src 'self';
+script-src 'self';
+style-src 'self' 'unsafe-inline';
+img-src 'self' data:;
+font-src 'self';
+connect-src 'self';
+object-src 'none';
+frame-src 'none';
+base-uri 'none';
+form-action 'none';
+frame-ancestors 'none';
+```
+
+如 Tailwind 构建后不需要 inline style，应继续收紧。
+
+### 20.4 导航和外链
+
+- `will-navigate` 默认阻止；
+- `setWindowOpenHandler` 默认 deny；
+- 只有经过白名单验证的 HTTPS 链接才能 `shell.openExternal`；
+- 禁止把用户或会话内容拼成 URL；
+- GitHub、文档和 Release 链接集中在一个 allowlist 模块。
+
+### 20.5 权限
+
+桌面 UI 不需要：
+
+- 摄像头；
+- 麦克风；
+- 屏幕捕获；
+- 定位；
+- USB/HID/Serial；
+- 通知读取；
+- 浏览器 File System API。
+
+权限检查和请求默认全部拒绝。
+
+### 20.6 Electron Fuses
+
+生产打包阶段评估并锁定：
+
+- 禁止 Run As Node；
+- 禁止 Node Options 环境变量；
+- 禁止生产 CLI Inspect；
+- 启用 ASAR Integrity；
+- 仅从 ASAR 加载应用代码。
+
+实际 Fuse 组合必须经过 packaged smoke test，不能直接照抄模板。
+
+### 20.7 数据隐私
+
+任何功能（包括 History）都不得读取、复制、记录或上传认证材料：
+
+- `auth.json`；
+- API Key；
+- Token；
+- Cookie；
+
+History 仅在用户明确打开详情或提交正文搜索后读取内容并本地展示。完整 Diagnostics 和选定 Repair 可按各自合同流式扫描；Provider 变长替换可原样复制尾部，不能借机解析/重序列化正文。消息和 `encrypted_content` 不进入应用数据库、持久缓存、日志、诊断包或遥测，加密内容不能修改或解密。日志仅使用合同允许的结构化字段。
+
+---
+
+## 21. 日志、诊断与遥测
+
+### 21.1 默认无遥测
+
+首版不默认收集远程遥测。
+
+原因：
+
+- 项目操作本地 Codex 数据；
+- 用户信任优先；
+- 开源项目无需为了“数据完整”引入隐私负担。
+
+### 21.2 本地日志
+
+日志包含：
+
+- 时间；
+- App/Core/Electron 版本；
+- operationId；
+- stage；
+- error code；
+- 影响数量；
+- 路径经过 Home 缩写或 Hash；
+- Runtime 崩溃信息。
+
+Electron Main 的 `OperationLogService` 记录 Sync、Switch、Repair、Restore、备份清理、Diagnostics、Watch、Update、Profile 与 Core Runtime 生命周期；普通 Status 刷新、聊天浏览和聊天搜索不记录。活动记录原子更新，终态写入 JSONL；耗时使用单调时钟，阶段耗时按结构化 ProgressEvent 到达时间计算，不解析 console 文本。
+
+日志不包含：
+
+- 消息正文；
+- Token；
+- Provider 认证字段；
+- rollout 完整 JSON；
+- SQLite 行完整内容。
+
+### 21.3 日志轮转
+
+V1 切换历史按 [ADR-0037](adr/0037-switch-history-and-provider-preparation-facts.md) 保存同 config 绑定的 Provider/根模型计划前后值，和最终 outcome 分开；旧记录不补造。Desktop 最近成功 Provider 复用日志、按 Profile/revision 和当前配置过滤，只填草稿、无后台轮询。日志业务不进入 Core 写入 API。
+
+建议：
+
+```text
+单文件 ≤ 5 MB
+保留 ≤ 5 个文件
+Debug 日志默认关闭
+用户导出诊断包时再次脱敏
+```
+
+### 21.4 诊断包
+
+用户主动导出：
+
+```text
+diagnostics.zip
+├─ app-info.json
+├─ status-summary.json
+├─ storage-layout.json
+├─ recent-redacted-logs/
+└─ pending-transaction-summary.json
+```
+
+不包含真实 rollout 和数据库。
+
+---
+
+## 22. 性能架构
+
+### 22.1 核心原则
+
+- Provider 首行读取、合格等长原地覆盖、不等长尾部字节复制和重试收敛必须通过 [PIO-1～PIO-6](architecture/NODE_CORE_ARCHITECTURE_ZH.md#3-provider-io-不变量必须保持)；读取边界/写入字节/文件身份/hash 是门禁，耗时不是替代证据；
+- Main Process 不执行长任务；
+- Core Runtime 懒启动；
+- 首屏不等待完整历史扫描；
+- 首页先显示 Shell 和最近 Profile；
+- Status 保持有界轻量读取，界面显示加载/刷新状态；显式 Diagnostics/Repair 预览才按 ADR-0032 上报请求扫描进度；
+- 大 rollout 继续流式处理；
+- History 分页；
+- 不把整个会话列表长期放入 React 全局状态；
+- 使用 Query Cache，但设置合理失效时间。
+
+### 22.2 初始性能目标
+
+V1 Provider Prepare 已按 ADR-0037 共享单轮有限首行事实，Apply 仍重捕 revision/实际目标与新鲜 mtime，不复用预览 descriptor。时间戳恢复、原地资格、Flush、原子替换与写前检查不是性能开关。Windows 临时合成分项基准见 `scripts/benchmark-windows-provider-rewrite.mjs`，计时不代表真实用户数据或 packaged 全链路结果。
+
+以下是工程预算，不是对所有机器的宣传承诺：
+
+| 指标 | 初始目标 |
+| --- | --- |
+| 主窗口可见 | 参考机器冷启动 1.5 秒左右 |
+| UI 首次可交互 | 不等待 Core 完整扫描 |
+| Main 阻塞任务 | 单次不超过约 50 ms |
+| Renderer 输入响应 | 普通操作约 100 ms 内反馈 |
+| Status 读取 | 轻量快照、漂移最多一次受限重试；不发 request-progress，不伪造写 Operation |
+| 显式 Diagnostics / Repair 预览 | 当前阶段真实进度与等待耗时；可信 Host control 支持阶段边界取消 |
+| Idle CPU | 无 Watch 时接近 0 |
+| Watch | 防抖、合并事件、不忙轮询 |
+| History | 虚拟列表或分页，避免一次渲染全部 |
+| Windows app.asar | ≤ 3 MiB |
+| Windows 解包目录 | ≤ 280 MiB |
+| Windows NSIS / ZIP | ≤ 105 MiB / 130 MiB |
+
+Windows 包只保留 `zh-CN` 与 `en-US` Chromium locale。React、共享 UI 与图标等由 Vite 打入 Renderer 后不得再作为 Desktop production dependency 重复进入 ASAR；`better-sqlite3` fallback、更新运行时、许可证和正常 Windows D3D/GPU 路径继续保留。体积门禁失败时报告组成并定向优化，不自动切换桌面架构。
+
+[ADR-0026](adr/0026-windows-package-size-budget.md) 显式压缩各构建入口，并将完整 Chromium 许可证无损 ZIP 归档在 Windows 程序目录中，附离线阅读说明和原文 SHA256；构建与最终容器审计都验证解压原文。该优化不删除条款、不要求另行下载，也不改变同步核心。解包体积与下载体积必须分开测量。
+
+端到端桌面性能结论应基于 Packaged Build，而不是 Dev Server。底层文件算法可使用独立合成基准，但必须标明样本数量/大小、环境、计时范围与未测项，不能当成桌面全流程或真实 Home 的提速保证。时间戳、正文 hash、原地身份和失败语义仍是必过门禁。
+
+### 22.3 启动顺序
+
+```text
+显示窗口
+  ↓
+加载主题 / 语言 / Profile
+  ↓
+首屏 Skeleton
+  ↓
+懒启动 Core Runtime
+  ↓
+读取轻量 Status
+  ↓
+当天首次启动检查一次更新（无定时轮询）
+  ↓
+用户进入 History 时才加载历史能力
+```
+
+---
+
+## 23. CLI 兼容架构
+
+### 23.1 保留命令
+
+```text
+status
+sync
+switch
+diagnostics
+repair
+restore
+watch
+web
+prune-backups
+install-windows-launcher
+```
+
+### 23.2 新增机器可读输出
+
+V1 已有 opt-in JSON 合同，例如：
+
+```bash
+codex-provider status --json
+codex-provider sync --json
+codex-provider switch openai --json
+codex-provider restore <backup> --json
+```
+
+JSON 输出：
+
+- 使用稳定 Schema Version；
+- stdout 只输出 JSON；
+- 日志和人类提示写 stderr；
+- 退出码稳定；
+- 不把 Error Stack 默认输出给普通用户。
+
+### 23.3 退出码合同
+
+Human 模式保持 `0/1`；以下仅适用于 JSON 模式，完整语义以 [CLI 合同](architecture/contracts/CLI_CONTRACT_ZH.md) 为准：
+
+| Exit Code | 含义 |
+| --- | --- |
+| `0` | 完成或无需修改 |
+| `1` | 普通失败 |
+| `2` | 参数错误、计划失效或状态漂移 |
+| `3` | Partial，跳过锁定/变化目标或 mutation 后失败 |
+| `4` | Recovery Required |
+| `5` | Busy / Lock Unverifiable |
+| `130` | 用户取消 / SIGINT |
+
+stdout 严格一个 `{schemaVersion, command, ok, outcome, result, warnings, error}` 对象，进度只到 stderr。不得以 UI/内部重构名义改变兼容退出码。
+
+### 23.4 Node 版本政策
+
+- 根 npm CLI 继续支持 Node `>=16.20.2`；
+- 现代 workspace、Web/Electron 构建和 CI 使用 Node 24；
+- 不因为新增 Electron 就强制 CLI 用户立刻升级；
+- 不把 V1 版本号当成提高根包最低 Node 的授权；
+- npm 包继续输出编译后的 JavaScript。
+
+### 23.5 CLI 与 Desktop 的关系
+
+- Desktop 不调用 CLI 文本；
+- Desktop 不解析 stdout；
+- Desktop 调用 CoreFacade；CLI 仍通过公开兼容适配层调用同一业务用例，不解析 Desktop IPC；
+- `--json` 是外部自动化合同，不是 Electron 内部 IPC。
+
+---
+
+## 24. Local Web UI 兼容
+
+### 24.1 保留价值
+
+Local Web UI 仍适合：
+
+- 不想安装桌面客户端的用户；
+- 远程桌面或受限环境；
+- 开发调试；
+- Node CLI 用户；
+- Electron 尚未支持的平台。
+
+### 24.2 复用目标
+
+```text
+同一 packages/app-ui
+├─ DesktopCoreClient（IPC）
+└─ HttpCoreClient（localhost HTTP）
+```
+
+桌面与 Web 可以有少量能力差异：
+
+| 能力 | Desktop | Web |
+| --- | --- | --- |
+| 文件夹选择 | 原生 Dialog | Server Profile API |
+| 更新 | 每天首次启动/手动检查；自动安装依实际启用的发布通道 | 不适用 |
+| Tray | 非当前必备能力；未来需独立实现/验收 | 不适用 |
+| 配对 | 不需要 | 需要 |
+| Core 通信 | IPC | localhost HTTP |
+
+### 24.3 Web 安全能力不能倒退
+
+保留：
+
+- 只监听 `127.0.0.1`；
+- 一次性配对；
+- Device Credential；
+- Profile Revision；
+- Storage Revision；
+- Request Size 限制；
+- CSP；
+- 路径由服务器 Profile 管理；
+- 写操作明确授权；直接同步以点击授权，其他预览操作确认后 Apply。
+
+---
+
+## 25. 构建工具链
+
+### 25.1 推荐组合
+
+```text
+Electron
++ electron-vite
++ electron-builder
++ React / TypeScript / Vite
+```
+
+选择原因：
+
+- 当前 Web UI 已经使用 Vite；
+- electron-vite 同时处理 Main、Preload、Renderer；
+- electron-builder 覆盖 Windows/macOS/Linux 安装包、签名和更新；
+- 避免 Electron Forge Vite 插件当前仍标记为 Experimental 所带来的额外版本风险。
+
+### 25.2 版本策略
+
+- Electron 使用精确版本，不使用宽松 `^`；
+- electron-vite、electron-builder、native module 精确锁定；
+- 每月或每个安全发布窗口升级；
+- Electron 保持在官方支持的最近版本线；
+- 升级 Electron 时必须运行全平台 Packaged Smoke Test；
+- 不在功能 Release 临时升级 Electron Major。
+
+### 25.3 打包目标
+
+| 平台 | 架构 | 首发格式 |
+| --- | --- | --- |
+| Windows | x64 | NSIS Installer + Portable ZIP（可选） |
+| macOS | arm64 | DMG + ZIP |
+| macOS | x64 | DMG + ZIP |
+| Linux | x64 | AppImage + deb |
+
+后续根据真实需求增加：
+
+- Windows arm64；
+- Linux arm64；
+- rpm；
+- Flatpak。
+
+### 25.4 Artifact 命名
+
+```text
+CodexProviderSync-1.0.0-windows-x64-setup.exe
+CodexProviderSync-1.0.0-windows-x64-portable.zip
+CodexProviderSync-1.0.0-macos-arm64.dmg
+CodexProviderSync-1.0.0-macos-x64.dmg
+CodexProviderSync-1.0.0-linux-x64.AppImage
+CodexProviderSync-1.0.0-linux-x64.deb
+SHA256SUMS.txt
+```
+
+---
+
+## 26. 签名、Notarization 与更新
+
+### 26.1 Windows
+
+稳定版目标：
+
+- Authenticode 签名；
+- Installer 和可执行文件均签名；
+- Timestamp；
+- CI Secret 保护；
+- 证书轮换文档化。
+
+签名成本未解决前：
+
+- Preview 明确标记未签名；
+- 发布 SHA256；
+- 只从 GitHub Releases 分发；
+- README 说明警告原因；
+- 不伪装成已签名版本。
+
+### 26.2 macOS
+
+稳定发布必须：
+
+- Developer ID 签名；
+- Hardened Runtime；
+- Notarization；
+- Staple Ticket；
+- x64 与 arm64 分别验证；
+- 在 macOS Runner 构建。
+
+### 26.3 自动更新
+
+启动检查按用户确认调整为每天首次启动一次（本地日期，延迟5秒，持久化去重），失败或无新版静默；只有更高版本才弹窗提示。没有循环检查，持续运行跨日也不自动触发；手动按钮保留，不自动下载或安装。旧Windows .NET单EXE更新不能直接迁移到Electron多文件产物，首次需手动安装或另做过渡升级器。
+
+V1本地交付补充见[ADR-0020](adr/0020-desktop-manual-release-check.md)：设置显示当前版本及检查入口。便携/未授权本地打包版采用手动公开版本检查与官方下载页，不启动自动安装；授权安装版保留electron-updater。检查/下载错误可见、进度事件推送，无轮询。实现更新能力不等同于已发布更新通道。
+
+建议使用 `electron-updater` + GitHub Releases：
+
+- Stable / Beta Channel 分离；
+- 应用启动后延迟检查；
+- 正在执行写操作时不安装；
+- Pending Recovery 时禁止更新重启；
+- 更新下载完成后由用户确认重启；
+- Windows、macOS 和 AppImage 先支持；
+- deb 用户首版可仅通知新版。
+
+### 26.4 更新安全规则
+
+- 只信任正式 Release；
+- 不从任意 URL 更新；
+- 不在 Renderer 实现更新下载；
+- 更新错误不能影响 Core 操作；
+- Release 撤回必须发布更高版本修复，不能覆盖同版本资源。
+
+---
+
+## 27. 测试体系
+
+### 27.1 测试金字塔
+
+```text
+Packaged E2E / Real OS Smoke
+            ▲
+Electron IPC / Runtime Integration
+            ▲
+React Feature / Component Tests
+            ▲
+Core Integration / Fault Injection
+            ▲
+Core Unit Tests
+```
+
+### 27.2 Core 测试
+
+现有 `node:test` 测试应继续保留，不因 UI 重构整体改为 Vitest。
+
+重点覆盖：
+
+- config；
+- storage layout；
+- SQLite 驱动；
+- rollout 扫描；
+- 大文件；
+- 锁；
+- 备份；
+- transaction journal；
+- rollback；
+- restore；
+- watch；
+- WSL；
+- fault injection；
+- web profile revision。
+
+### 27.3 行为兼容 Fixtures
+
+```text
+packages/test-fixtures/
+├─ default-openai/
+├─ custom-provider/
+├─ mixed-provider/
+├─ archived-sessions/
+├─ implicit-openai/
+├─ root-model/
+├─ custom-sqlite-home/
+├─ legacy-state-db/
+├─ dual-state-db-candidates/
+├─ locked-rollout/
+├─ active-rollout-changing/
+├─ encrypted-content/
+├─ large-rollout/
+├─ malformed-rollout/
+├─ sqlite-busy/
+├─ pending-journal/
+├─ restore-relocation/
+├─ workspace-roots/
+└─ wsl-unc/
+```
+
+每个 Fixture 要包含：
+
+- 输入状态；
+- 预期 Status；
+- 预期 Plan；
+- 预期写入；
+- 不得变化的字节/字段；
+- 预期 Backup；
+- 预期 Restore 结果；
+- 预期错误码。
+
+### 27.4 .NET 对照测试
+
+迁移期用 Node 与 .NET 对同一 Fixture 运行：
+
+```text
+同一输入副本
+  ├─ Node Core
+  └─ .NET Core
+        ↓
+比较语义结果、目标字段、备份覆盖和错误分类
+```
+
+Node 是目标核心，但 .NET 可以作为已有行为证据。差异必须：
+
+- 明确哪一方正确；
+- 补测试；
+- 写迁移记录；
+- 不静默选择。
+
+### 27.5 Contract 测试
+
+检查：
+
+- Core DTO 可序列化；
+- IPC Schema 与 Core Schema 一致；
+- Web API 与 Desktop Client 表达相同语义；
+- Error Code 不随 message 改变；
+- Protocol Version 不兼容时明确失败。
+
+### 27.6 Renderer 测试
+
+使用 Vitest + Testing Library：
+
+- Status 页面；
+- Plan 确认；
+- Partial Result；
+- Recovery Required；
+- Profile Changed；
+- Progress；
+- Cancel；
+- Error Boundary；
+- i18n；
+- Keyboard Navigation。
+
+所有 UI 测试使用 `MockCoreClient`，不依赖真实 Electron。
+
+### 27.7 Electron E2E
+
+使用 Playwright Electron：
+
+- 启动应用；
+- 验证安全配置；
+- Mock 原生 Dialog；
+- 加载临时 Codex Home；
+- Status；
+- Prepare Sync；
+- Apply Sync；
+- 进度；
+- Restore；
+- Runtime Crash；
+- Pending Recovery；
+- 截图回归。
+
+测试只能使用临时目录和 Fixtures，禁止接触开发者真实 `~/.codex`。
+
+### 27.8 Packaged Smoke Test
+
+不能只测试 Dev Build。每个平台至少测试：
+
+1. 安装/解压；
+2. 启动；
+3. Runtime 启动；
+4. SQLite Driver；
+5. 临时 Fixture Status；
+6. 一次 Sync + Restore；
+7. 退出；
+8. 卸载或清理。
+
+---
+
+## 28. CI 架构
+
+### 28.1 Pull Request CI
+
+以下 YAML 是结构伪代码；`最低支持版本` 与 `当前 LTS` 不是可直接写入 Workflow 的字面值。实际矩阵必须从 `package.json#engines`、仓库锁定的构建工具链和正式支持政策读取明确版本。
+
+```yaml
+core-test:
+  matrix:
+    os: [windows-latest, ubuntu-latest, macos-latest]
+    node: [最低支持版本, 当前 LTS]
+
+typecheck-lint:
+  node: 当前 LTS
+
+renderer-test:
+  node: 当前 LTS
+
+electron-integration:
+  matrix:
+    os: [windows-latest, ubuntu-latest, macos-latest]
+
+package-smoke:
+  matrix:
+    os: [windows-latest, ubuntu-latest, macos-latest]
+```
+
+### 28.2 Required Gate
+
+统一 `ci-gate` 检查：
+
+- Core Tests；
+- Typecheck；
+- Lint；
+- Web Build；
+- Electron Build；
+- Electron Integration；
+- Packaged Smoke；
+- Legacy .NET Tests（迁移期间）。
+
+### 28.3 Nightly
+
+Nightly 负责高成本测试：
+
+- 大型 rollout；
+- 多 Electron/Node 组合；
+- 全平台 package；
+- 自动更新测试；
+- 安全扫描；
+- 安装器验证；
+- 长时间 Watch；
+- 内存和启动性能基线。
+
+### 28.4 Release CI
+
+```mermaid
+flowchart LR
+    Tag[Signed Release Tag] --> Verify[版本与 main 校验]
+    Verify --> Test[完整 CI]
+    Test --> Win[Windows Build + Sign]
+    Test --> Mac[macOS Build + Sign + Notarize]
+    Test --> Linux[Linux Build]
+    Win --> Release[GitHub Release Draft]
+    Mac --> Release
+    Linux --> Release
+    Release --> Checksums[Checksums / Metadata]
+    Checksums --> Publish[Publish Release]
+```
+
+### 28.5 Release 必须失败关闭
+
+以下任一失败，不发布：
+
+- 版本不一致；
+- Tag 不在 main；
+- Core Test；
+- Packaged Smoke；
+- native SQLite 加载；
+- macOS Notarization；
+- Windows 签名（签名阶段启用后）；
+- Artifact 缺失；
+- Update Metadata 缺失。
+
+---
+
+## 29. 版本与发布通道
+
+### 29.1 通道
+
+```text
+Stable
+Beta
+Nightly（仅开发者）
+```
+
+### 29.2 迁移期版本
+
+建议：
+
+```text
+0.5.x       现有 Node / .NET 稳定维护
+1.0.0-alpha Electron 只读和架构验证
+1.0.0-beta  Electron 写能力开放
+1.0.0-rc    功能冻结、跨平台发布验证
+1.0.0       Electron 成为默认桌面产品
+```
+
+### 29.3 npm 与桌面版本
+
+迁移期可独立发布，但必须明确：
+
+- CLI Package Version；
+- Desktop Version；
+- Core Protocol Version；
+- Backup Metadata Version；
+- IPC Protocol Version。
+
+v1 稳定后，建议统一仓库 Release 说明，并在兼容范围内尽量对齐版本。
+
+---
+
+## 30. 迁移路线
+
+### 阶段 0：冻结决策与安全合同
+
+交付：
+
+- 本架构文档；
+- ADR；
+- Core 外部行为清单；
+- CLI 命令合同；
+- Error Code 清单；
+- 测试 Fixture 清单。
+
+规则：
+
+- .NET 仅修严重 Bug；
+- 不继续增加另一套大型业务能力；
+- Node Core 仍是功能开发主线。
+
+### 阶段 1：提取 Node Core，不改行为
+
+目标：
+
+```text
+当前 src/*.js
+     ↓
+明确 public-api
+     ↓
+CLI / Web 都通过 public-api
+```
+
+动作：
+
+- 拆 `service.js` 中展示逻辑和业务逻辑；
+- CLI Presenter 移出 Core；
+- Web DTO 映射移出 Core；
+- Core 只返回结构化数据；
+- 加入 `--json`；
+- 不改同步算法；
+- 原测试全部通过。
+
+### 阶段 2：Contracts 与 Core Client
+
+交付：
+
+- `packages/core`（先封装阶段 1 已收口的 Node Core，再以独立 PR 逐模块迁移；不与业务改动混在一起）；
+- `packages/contracts`；
+- `CoreErrorDto`；
+- Progress Event；
+- `CoreClient`；
+- `HttpCoreClient`；
+- `MockCoreClient`；
+- API Schema Version。
+
+同时开始拆当前巨型 React App，但 Web UI 行为保持不变。
+
+### 阶段 3：Electron Read-only Alpha
+
+Electron 只开放：
+
+- App 启动；
+- Profiles；
+- Status；
+- Backup List；
+- Diagnostics；
+- History 只读（可选）；
+- 跨平台 Package。
+
+禁止：
+
+- Sync；
+- Switch；
+- Restore；
+- Watch 自动写入。
+
+验收：
+
+- Windows/macOS/Linux Packaged Build；
+- Renderer 无 Node；
+- Utility Process 正常；
+- Status 与 CLI 结果一致；
+- Runtime Crash 能恢复；
+- 不访问真实用户数据的 E2E。
+
+### 阶段 4：Sync / Switch Beta
+
+开放：
+
+- Prepare Sync；
+- Apply Sync；
+- Prepare Switch；
+- Apply Switch；
+- Progress；
+- Cancel；
+- Partial Result；
+- Backup 跳转。
+
+验收：
+
+- 与 Node CLI 同一 Core；
+- Plan Stale 处理；
+- SQLite Busy；
+- Locked Rollout；
+- Fault Injection；
+- Sync 后 Restore 回原状态。
+
+### 阶段 5：Restore / Watch / 完整功能
+
+开放：
+
+- Restore；
+- Prune；
+- Watch；
+- Recovery Required；
+- Update；
+- 诊断包。
+
+### 阶段 6：Electron Stable，替代 .NET
+
+条件：
+
+- 三平台稳定；
+- 关键功能等价；
+- 无已知数据破坏 Bug；
+- Beta 用户验证；
+- 文档完整；
+- Installer/签名策略明确；
+- 旧备份可恢复；
+- 新备份 CLI 可恢复；
+- .NET 功能没有独占能力。
+
+动作：
+
+- README 默认推荐 Electron；
+- .NET 标记 Legacy；
+- 保留至少两个维护发布周期；
+- 不立即删除旧 Release。
+
+### 阶段 7：清理 Legacy
+
+- 停止 .NET 正常 CI；
+- 保留 legacy tag/branch 和文档；
+- 从 active source tree 移出；
+- 删除重复业务代码；
+- 保留迁移说明；
+- Node CLI 永久保留，除非未来另有独立 ADR。
+
+---
+
+## 31. V1 内部 Checkpoint 序列
+
+在 ADR-0011 的单最终 PR 例外下，以下 `C0`～`C10` 是 V1 分支内的不可变 checkpoint，不是已经合入的独立 PR。旧 PR 2～PR 10 的依赖与安全意图按 ADR-0011 映射到这些 checkpoint。每个 checkpoint 必须保留 commit、测试证据和回退点；所有 Phase 状态仍以最终合入受保护分支为准。
+
+### C0：V1 交付治理与 Restore v2 文档合同
+
+- 新增 ADR-0011～ADR-0013；
+- 使架构、执行索引、Core/Error/Fixture 合同对单最终 PR 与 Restore v2 目标可互相导航；
+- 固化基线测试与依赖审计，并消除现有 Vite 链的 high/moderate 告警；
+- 不把目标合同描述为已经实现。
+
+### 已完成基线：PR 1（阶段 0 原合同）
+
+- 以本文件作为已确认的架构基线；
+- 新增 ADR-0001～ADR-0010；
+- 补齐 Core 外部行为、CLI、Error Code 与 Fixture 清单；
+- 更新 `AGENTS.md` 中的 ADR 入口；
+- 不改运行代码。
+
+### C1：Node Core 职责与端口拆分
+
+- `CoreFacade` 作为唯一产品入口，根 `src/public-api.js` 保留为 CLI 兼容转发层；
+- 建立 Status、ProviderSync、ProviderSwitch、Diagnostics、Repair、Backups、Restore、History、Watch、OperationRuntime 的职责边界；
+- 建立 ConfigStore、SessionStore、StateDbStore、GlobalStateStore 四个 CodexStorage 端口；
+- C1 只移动职责，保持 DTO、锁、journal、备份、回滚和外部行为。
+
+### C2：ProviderSync 收窄、Diagnostics 与 Repair
+
+- ProviderSync 固定从 config 读取目标 Provider，只扫描 rollout 首行；
+- 等长 Provider 原地更新，不等长 Provider 流式临时替换，正文 bytes 不变；
+- 删除公开 `sync --provider`、`--fast`、`syncMode` 与 `FAST_MODE_UNSUPPORTED`；
+- 新增手动完整只读 Diagnostics 和显式 `prepareRepair/applyRepair`，贯通 CLI/Web/Electron。
+
+### C3：普通写轻量化
+
+- Sync、Switch、Repair 继续使用短期、单次、Home lock 内重校验的 planId；
+- 普通写只持 Home lock，SQLite 并发交给原生事务；
+- noop 不备份；实际 mutation 前创建 UndoBackup；普通写不创建 journal 或自动回滚；
+- mutation 后故障返回带 backup/阶段/重试建议的 partial，由重复执行收敛；
+- Restore 独立保留 snapshot、journal、Hash 校验与补偿，但也只持 Home lock；旧普通 journal 只读兼容。
+
+### C4：Workspace、Contracts 与 Core Client
+
+- npm workspaces；
+- `packages/core` 早期先包装阶段 1 的 `src/public-api.js`；当前业务编排已迁入 Core，根 service/watch/diagnostics 仅保留兼容转发；
+- `packages/contracts`；
+- `packages/core-client`；
+- 根 npm 包继续独立提供 Node 16 CLI，Electron 依赖不进入其 tarball。
+
+### C5：共享 React UI 与 Web 迁移
+
+- 建立 AppShell、Design System、概览/备份恢复/聊天记录/存储配置/高级功能/设置六个共享页面；桌面按 capability 增加操作日志，Sync/Switch 不占独立导航；
+- Web 通过 `HttpCoreClient` 复用 `app-ui`；
+- 保留 pairing、Origin、Profile/Storage Revision、History 隐私边界。
+
+### C6：Electron 安全骨架、Utility Runtime 与只读能力
+
+- electron-vite；
+- electron-builder；
+- Main/Preload/Renderer/Core Utility Process 边界；
+- 安全 BrowserWindow、白名单 IPC、Hello/Version 握手与 crash recovery；
+- 只开放 Profile、Status、Backup、Diagnostics 和按需 History。
+
+### C7：Electron Sync / Switch
+
+- 只经 Prepare/Confirm/Apply 开放写入；
+- Provider 与三种 model 策略；
+- Progress、Cancel、Partial、Backup-first 与安全 Fixture。
+
+### C8：Restore / Watch / Diagnostics / Update
+
+- Restore v2 恢复前 snapshot、独立 journal、补偿与 ack reconciliation；
+- Foreign Pending、Prune 保护、Watch 优先级、脱敏诊断包；
+- Main-only 更新，写入或 Pending Recovery 时禁止安装。
+
+### C9：打包、CI 与发布工程
+
+- 四个目标平台产物、native SQLite、asar 审计、SBOM 与 checksums；
+- Electron integration 与 packaged smoke 纳入唯一 `ci-gate`；
+- CI 只生成候选 artifact，不自动发布。
+
+### C10：最终证据与 Legacy 交接
+
+- 同步最新 `main` 并重跑全部门禁；
+- README 默认推荐 Electron，.NET 保留并标记 Legacy；
+- 生成脱敏 evidence bundle；
+- tag、npm/GitHub Release、签名、公证和更新通道继续等待单独授权。
+
+---
+
+## 32. 风险登记
+
+| 风险 | 概率 | 影响 | 缓解 |
+| --- | --- | --- | --- |
+| Electron 包体积引发用户反感 | 中 | 中 | 透明说明、测量、提供 CLI、延迟加载 |
+| Electron Main 被 Core 阻塞 | 中 | 高 | Utility Process、异步 IPC、性能测试 |
+| Native SQLite 打包失败 | 中 | 高 | node:sqlite 优先、ABI 重建、asarUnpack、全平台 smoke |
+| React 重写时功能丢失 | 中 | 高 | Shared CoreClient、Feature 对照、E2E |
+| .NET 与 Node 行为不一致 | 高 | 中 | Fixtures、差异记录、明确权威行为 |
+| CLI 用户被破坏 | 中 | 极高 | 命令合同、`--json`、SemVer、回归测试 |
+| Electron 安全配置错误 | 中 | 高 | Security Checklist、IPC 白名单、CSP、Electronegativity/审计 |
+| 更新导致操作中断 | 低 | 极高 | 写操作期间禁止安装更新、Journal、延迟重启 |
+| Runtime 崩溃后状态不明 | 低 | 极高 | Journal、Pending Recovery、Supervisor |
+| 长期同时维护 Node/.NET/Electron | 中 | 高 | 明确阶段退出条件，.NET 功能冻结 |
+| UI 继续长成巨型 App | 高 | 中 | Feature Folder、CoreClient、代码审查规则 |
+| 长期重写分支与 main 漂移 | 高 | 高 | 小 PR 合入 main、Feature Flag、Prerelease |
+| Linux 分发差异 | 中 | 中 | AppImage + deb 首发、Ubuntu LTS smoke |
+| 未签名安装警告 | 高 | 中 | Preview 标记、校验和、稳定版签名计划 |
+
+---
+
+## 33. 代码审查门槛
+
+### 33.1 Core 改动
+
+先核对 [当前 Core 约束](architecture/NODE_CORE_ARCHITECTURE_ZH.md) 和 `npm run architecture:check`：不得丢失合格等长原地写、首行扫描与正文 hash 保持，不得让模型/修复混回 Sync。完整 `npm test` 与适用平台门禁仍需独立通过。
+
+必须回答：
+
+- 是否修改外部行为？
+- 是否影响备份？
+- 是否影响锁？
+- 是否影响事务？
+- 是否影响 Restore？
+- 是否影响 CLI 合同？
+- 是否有 Fixture？
+- 是否测试失败路径？
+- 是否可能触碰 `auth.json` 或消息正文？
+
+### 33.2 IPC 改动
+
+必须回答：
+
+- 是否需要新增能力？
+- Payload 是否有 Schema？
+- 是否验证 Sender？
+- Renderer 是否能提交任意路径？
+- 是否暴露通用 Node/Electron API？
+- 是否有 Contract Test？
+
+### 33.3 UI 改动
+
+必须回答：
+
+- 是否通过 CoreClient？
+- 是否在页面复制业务规则？
+- 是否支持 Loading/Error/Empty/Recovery？
+- 是否可键盘操作？
+- 是否有截图或 E2E？
+- 是否在 `App.tsx` 堆积页面逻辑？
+
+### 33.4 Release 改动
+
+必须回答：
+
+- 三平台产物是否完整？
+- native module 是否能加载？
+- 是否影响自动更新？
+- 版本是否一致？
+- 签名/Notarization 是否成功？
+- 是否能从旧版本升级？
+- 是否有回滚 Release？
+
+---
+
+## 34. AI / Codex 执行规则
+
+开发先读当前 Core 约束，再读适用合同/ADR；本文旧目录图不授权新建重复实现。代码、文档或测试不一致时登记差异，禁止只改断言掩盖退化。见 [ADR-0023](adr/0023-current-core-invariants-and-drift-gate.md)。
+
+在本仓库工作的 AI 必须遵守：
+
+1. 先阅读 `AGENTS.md`、本架构文档和相关 ADR；
+2. 不直接操作真实用户 `~/.codex`；
+3. 测试只能使用临时目录和 Fixtures；
+4. 不把业务规则写进 Renderer、Preload、IPC Handler；
+5. 不新增第二套同步实现；
+6. 不以“一次性翻译”为理由重写高风险 Core；
+7. 默认一个 PR、或 ADR-0011 的一个内部 checkpoint，只解决一个主要架构目标；
+8. 修改外部合同必须更新 Contract Test；
+9. 修改安全流程必须补失败/回滚测试；
+10. 不读取或输出认证材料；正文仅由明确 History/Diagnostics/Repair 合同处理，不进入日志、诊断包或持久缓存；
+11. 不删除旧实现，除非达到阶段退出标准；
+12. 任何跨层依赖必须有 ADR 或明确评审。
+
+### 34.1 AI 禁止模式
+
+```text
+“为了方便，在 Renderer 直接 import fs”
+“先在 IPC Handler 实现一份，之后再抽”
+“把旧 Node 代码整体改写成 TypeScript”
+“删除旧测试，改写新测试”
+“用新的数据库缓存所有 Session”
+“直接解析 CLI 人类文本给 Electron”
+“遇到差异时默认以新实现为准”
+```
+
+---
+
+## 35. ADR 清单
+
+本文件确认总方向；以下细分决策在阶段 0 和对应迁移 checkpoint 建立并逐项 Accepted：
+
+```text
+docs/adr/
+├─ 0001-electron-over-tauri.md
+├─ 0002-node-core-as-single-authority.md
+├─ 0003-preserve-node-cli-contract.md
+├─ 0004-renderer-has-no-node-access.md
+├─ 0005-run-core-in-electron-utility-process.md
+├─ 0006-no-application-database.md
+├─ 0007-shared-ui-through-core-client.md
+├─ 0008-incremental-migration-no-big-bang-rewrite.md
+├─ 0009-plan-confirm-apply-for-writes.md
+├─ 0010-electron-vite-and-electron-builder.md
+├─ 0011-v1-single-branch-single-final-pr.md
+├─ 0012-dual-resource-lock-contract.md
+├─ 0013-restore-v2-recovery-state-machine.md
+├─ 0014-npm-workspace-and-dependency-boundaries.md
+├─ 0015-provider-byte-updates-and-fast-sync.md（Fast/全文决策已被 0016 取代）
+├─ 0016-node-core-responsibility-boundaries-and-lightweight-writes.md
+├─ 0017-local-storage-display-and-saved-history-titles.md
+├─ 0018-history-session-actions.md
+├─ 0019-everyday-sync-and-advanced-repair.md
+├─ 0020-desktop-manual-release-check.md
+├─ 0021-scoped-advanced-repair-and-readonly-integrity.md
+├─ 0022-history-project-roots-and-child-pagination.md
+├─ 0023-current-core-invariants-and-drift-gate.md
+├─ 0024-profile-scoped-controls-and-actionable-feedback.md
+├─ 0025-user-feedback-and-window-preferences.md
+├─ 0026-windows-package-size-budget.md
+└─ 0027-unified-backup-retention.md
+```
+
+ADR 一旦 Accepted，不应通过普通重构 PR 静默推翻。
+
+---
+
+## 36. Definition of Done
+
+Electron v1.0 只有同时满足以下条件才算完成。
+
+### 架构
+
+- [ ] CLI、Web、Desktop 调用同一 Node Core；
+- [ ] .NET 不再是正式功能权威；
+- [ ] Core 不依赖 Electron/React；
+- [ ] Renderer 无 Node 权限；
+- [ ] Main 不执行长业务任务；
+- [ ] 无应用 Session 数据库。
+
+### 功能
+
+- [ ] Status；
+- [ ] Sync；
+- [ ] Switch；
+- [ ] Backup；
+- [ ] Restore；
+- [ ] Prune；
+- [ ] Watch；
+- [ ] History 只读；
+- [ ] Profiles；
+- [ ] Diagnostics / 显式 Repair。
+
+### 安全
+
+- [ ] 备份优先；
+- [ ] 未解决 Restore journal 阻断；旧普通 journal 兼容与备份保护；
+- [ ] 普通写 partial 收敛；Restore 独立 Rollback/Recovery；
+- [ ] IPC 白名单；
+- [ ] CSP；
+- [ ] 导航限制；
+- [ ] 权限默认拒绝；
+- [ ] 不访问认证数据；
+- [ ] 日志脱敏；
+- [ ] 签名策略明确。
+
+### 兼容
+
+- [ ] npm 包名不变；
+- [ ] 主要 CLI 命令不变；
+- [ ] 旧 Backup 可恢复；
+- [ ] 新 Backup 可被 CLI 恢复；
+- [ ] WSL 仍由 CLI 支持；
+- [ ] Local Web UI 仍可用；
+- [ ] README 有迁移说明。
+
+### 平台
+
+- [ ] Windows x64；
+- [ ] macOS arm64；
+- [ ] macOS x64；
+- [ ] Linux x64；
+- [ ] Packaged Smoke；
+- [ ] 安装器与 Release Artifact；
+- [ ] 校验和。
+
+### 测试
+
+- [ ] Core 全部旧测试通过；
+- [ ] Contract Test；
+- [ ] Fault Injection；
+- [ ] React Test；
+- [ ] Electron E2E；
+- [ ] Packaged E2E；
+- [ ] Node/.NET 行为差异已处理；
+- [ ] 无真实 Codex Home 测试。
+
+---
+
+## 37. 最终推荐
+
+`codex-provider-sync` 的最佳演进路线不是重新选择一种“更高级”的语言，而是把当前已经被大量用户验证的 Node 能力提升为真正的单一产品核心。
+
+最终结构应稳定为：
+
+```text
+                    ┌───────────────────────┐
+                    │ React + TypeScript UI │
+                    └───────────┬───────────┘
+                                │
+                         Typed Electron IPC
+                                │
+                    ┌───────────▼───────────┐
+                    │ Electron Main/Preload │
+                    └───────────┬───────────┘
+                                │
+                         Utility Process
+                                │
+                    ┌───────────▼───────────┐
+Node CLI ──────────►│     唯一 Node Core     │◄──────── Local Web UI
+                    └───────────┬───────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │   Codex 原始数据存储    │
+                    └───────────────────────┘
+```
+
+本次架构升级的正确优先级是：
+
+```text
+1. 保住现有用户和数据安全
+2. 消除 Node/.NET 双核心
+3. 建立稳定 Core Contract
+4. 建立 Electron 跨平台产品
+5. 重做现代 React UI
+6. 统一测试与发布
+7. 最后清理 Legacy
+```
+
+而不是：
+
+```text
+先重写所有代码
+→ 再尝试恢复原有行为
+→ 最后让真实用户帮忙找兼容问题
+```
+
+---
+
+## 38. 参考依据
+
+当前本地增量以 [ADR-0042](adr/0042-windows-updater-and-version-reminders.md)（Windows 安装版更新、按版本提醒）和 [ADR-0043](adr/0043-status-provider-relevant-revisions.md)（普通 Status 排除非 Provider 变化）为准；这不代表已覆盖线上 v1.0.1 附件或完成线上升级验收。
+
+### 仓库内部
+
+- `README.md`
+- `AGENTS.md`
+- `docs/WORKING_PRINCIPLE_ZH.md`
+- `src/service.js`
+- `src/session-files.js`
+- `src/sqlite.js`
+- `src/sqlite-state.js`
+- `src/backup.js`
+- `src/locking.js`
+- `src/transaction-journal.js`
+- `src/web-server.js`
+- `packages/core/src/index.js` / `index.d.ts`
+- `packages/app-ui/src/App.tsx`
+- `apps/web/src/`
+- [Node Core 当前架构与开发约束](architecture/NODE_CORE_ARCHITECTURE_ZH.md)
+- `.github/workflows/ci.yml`
+- `.github/workflows/publish.yml`
+
+### Electron 官方
+
+- Process Model: https://www.electronjs.org/docs/latest/tutorial/process-model
+- Security: https://www.electronjs.org/docs/latest/tutorial/security
+- Context Isolation: https://www.electronjs.org/docs/latest/tutorial/context-isolation
+- contextBridge: https://www.electronjs.org/docs/latest/api/context-bridge
+- Utility Process: https://www.electronjs.org/docs/latest/api/utility-process
+- Performance: https://www.electronjs.org/docs/latest/tutorial/performance
+- Native Node Modules: https://www.electronjs.org/docs/latest/tutorial/using-native-node-modules
+- Code Signing: https://www.electronjs.org/docs/latest/tutorial/code-signing
+- Electron Timelines: https://www.electronjs.org/docs/latest/tutorial/electron-timelines
+- ASAR Integrity: https://www.electronjs.org/docs/latest/tutorial/asar-integrity
+- Protocol: https://www.electronjs.org/docs/latest/api/protocol
+
+### 构建与测试
+
+- electron-vite: https://electron-vite.org/guide/
+- electron-builder: https://www.electron.build/
+- electron-builder Auto Update: https://www.electron.build/docs/features/auto-update/
+- Playwright Electron: https://playwright.dev/docs/api/class-electron
+
+---
+
+**End of Document**
+
+## 2026-09-04：专项修复本地增量
+
+[ADR-0021](adr/0021-scoped-advanced-repair-and-readonly-integrity.md) 补充高级功能：字段来源说明、按原生会话 ID 选择并重新预览、Home 锁内修后核验和旧诊断过期提示。普通 Sync 仍仅对齐 Provider。完整诊断增加有界只读记录完整性/序号观察；显示索引格式尚未形成支持契约，明确未验证，不开放序号改写或索引重建。工作区设置保持全 Profile 范围，不允许局部会话覆盖全局设置。此增量不代表发布或迁移阶段 Completed。
+
+[ADR-0031](adr/0031-repair-choices-and-optional-model-adjustments.md) 将 UI 的 models 移至独立“高级调整”，其余三项按用户用途呈现为“专项修复”。两组默认折叠/空选，诊断当前完整结果仅提供展开聚焦；不自动勾选或执行。模型差异不是故障。预览说明实际 Plan 改动与不变项；Profile/revision 改变重置，旧/不完整结果不推荐。此项只调整共享界面和文案，Core/CLI、目标范围、备份和 Provider I/O 不变。
