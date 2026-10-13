@@ -64,7 +64,7 @@ macOS/Linux Electron 包尚未发布；CLI / Web 的 npm 版本独立发布。
 安装 Node.js `16.20.2+` 后运行，获得 npm 当前已发布的 CLI / Web 版本：
 
 ```bash
-npm install -g @dailin521/codex-provider-sync
+npm install -g "git+https://github.com/SherlockNolan/codex-provider-sync.git#main"
 codex-provider web
 ```
 
